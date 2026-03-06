@@ -1,0 +1,4 @@
+# Core POS flow uses Python standard library modules.
+# Barcode scanning feature dependencies:
+opencv-python
+pyzbar
