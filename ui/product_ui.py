@@ -51,23 +51,41 @@ def open_product_window():
         current_widget.bind("<Return>", on_enter)
 
     def save():
+        bc = barcode.get().strip()
+        nm = name.get().strip()
         try:
-            add_product(
-                barcode.get().strip(),
-                name.get().strip(),
-                float(price.get().strip()),
-                int(stock.get().strip()),
-            )
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Price must be number and stock must be whole number.")
+            pr = float(price.get().strip())
+        except Exception:
+            messagebox.showerror("Invalid Input", "Price must be a number.")
             return
+        try:
+            st = int(stock.get().strip())
+        except Exception:
+            messagebox.showerror("Invalid Input", "Stock must be a whole number.")
+            return
+
+        try:
+            add_product(bc, nm, pr, st)
         except sqlite3.IntegrityError:
-            messagebox.showerror("Duplicate Barcode", "This barcode already exists.")
+            # barcode exists – offer to adjust stock
+            answer = messagebox.askyesno(
+                "Barcode Exists",
+                "Product with this barcode already exists.\n" \
+                "Do you want to modify its stock by the entered amount?",
+            )
+            if answer:
+                try:
+                    from services.product_service import change_stock
+                    new_stock = change_stock(bc, st)
+                    messagebox.showinfo("Stock Updated", f"New stock level: {new_stock}")
+                except Exception as exc:
+                    messagebox.showerror("Update Failed", str(exc))
             return
         except Exception as exc:
             messagebox.showerror("Save Failed", str(exc))
             return
 
+        # clear fields after successful add
         barcode.delete(0, tk.END)
         name.delete(0, tk.END)
         price.delete(0, tk.END)

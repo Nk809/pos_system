@@ -65,7 +65,7 @@ On startup, terminal shows:
 1. Connect phone and laptop to same Wi-Fi.
 2. Open the exact URL shown in terminal on phone.
 3. For HTTPS self-signed certificate warning, open **Advanced** and proceed once.
-4. Use scanner + barcode input to add items to phone cart.
+4. Use scanner + barcode input to add items to phone cart.  When you tap the **Add To Cart** button the barcode is also forwarded to the desktop POS, so the main billing window will receive the scanned code automatically (quantity times if >1).
 5. Select payment mode (Cash/Online), then generate bill.
 
 ## Receipt Format

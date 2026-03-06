@@ -18,12 +18,17 @@ from features.thermal_printer import print_bill
 from services.billing_service import save_sale
 from services.product_service import search_product
 
+# when users add a barcode from the browser interface we place the
+# raw value in this queue. `BillingUI.poll_phone_scans` periodically
+# calls `pop_scanned_barcode` to pull new values and insert them into
+# the main POS cart as if a hardware scanner had been used.
 _barcode_queue = Queue()
 _server = None
 _thread = None
 _bridge_scheme = "http"
 _phone_cart = []
 _phone_cart_payment_mode = "Cash"
+_phone_cart_discount_percent = 0.0
 _phone_cart_lock = Lock()
 
 
@@ -74,13 +79,26 @@ def _content_type_for_image(path_obj):
 
 def _local_ip():
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ip = "127.0.0.1"
     try:
         probe.connect(("8.8.8.8", 80))
-        return probe.getsockname()[0]
+        ip = probe.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        pass
     finally:
         probe.close()
+
+    # if we only have loopback, attempt other lookups
+    if ip.startswith("127.") or ip == "0.0.0.0":
+        try:
+            host = socket.gethostname()
+            alt = socket.gethostbyname(host)
+            if alt and not alt.startswith("127."):
+                ip = alt
+        except Exception:
+            pass
+
+    return ip
 
 
 def _tls_paths():
@@ -316,15 +334,24 @@ def _normalize_payment_mode(mode_text):
     return "Online" if str(mode_text).strip().lower() == "online" else "Cash"
 
 
+def _normalize_discount_percent(raw_value):
+    parsed = _to_float(raw_value)
+    if parsed is None:
+        raise ValueError("Discount must be a valid number.")
+    if parsed < 0 or parsed > 100:
+        raise ValueError("Discount must be between 0 and 100.")
+    return round(float(parsed), 2)
+
+
 def _serialize_phone_cart_unlocked():
     items = []
-    total = 0.0
+    subtotal = 0.0
 
     for item in _phone_cart:
         qty = int(item["qty"])
         price = float(item["price"])
         line_total = round(qty * price, 2)
-        total += line_total
+        subtotal += line_total
 
         items.append(
             {
@@ -338,7 +365,18 @@ def _serialize_phone_cart_unlocked():
             }
         )
 
-    return {"items": items, "total": round(total, 2), "payment_mode": _phone_cart_payment_mode}
+    subtotal = round(subtotal, 2)
+    discount_percent = round(float(_phone_cart_discount_percent), 2)
+    discount_amount = round(subtotal * (discount_percent / 100.0), 2)
+    total = round(max(subtotal - discount_amount, 0.0), 2)
+    return {
+        "items": items,
+        "subtotal": subtotal,
+        "discount_percent": discount_percent,
+        "discount_amount": discount_amount,
+        "total": total,
+        "payment_mode": _phone_cart_payment_mode,
+    }
 
 
 def _phone_cart_success(message=""):
@@ -372,7 +410,8 @@ def _process_phone_cart_add_form(form):
     with _phone_cart_lock:
         existing = next((item for item in _phone_cart if int(item["id"]) == product_id), None)
         existing_qty = int(existing["qty"]) if existing else 0
-        new_qty = existing_qty + int(qty)
+        added_qty = int(qty)
+        new_qty = existing_qty + added_qty
         if new_qty > stock:
             return _phone_cart_error(f"Only {stock} unit(s) available for {name}.")
 
@@ -390,10 +429,47 @@ def _process_phone_cart_add_form(form):
                     "name": (name or "").strip(),
                     "price": price,
                     "stock": stock,
-                    "qty": int(qty),
+                    "qty": added_qty,
                 }
             )
 
+        # also forward scanned barcodes to the desktop queue so the main POS UI picks them up
+        # push once per unit added (mimics scanning multiple times)
+        bridge_code = (product_barcode or barcode).strip()
+        if bridge_code:
+            for _ in range(added_qty):
+                try:
+                    _barcode_queue.put(bridge_code)
+                except Exception:
+                    pass
+
+        cart_data = _serialize_phone_cart_unlocked()
+    return {"success": True, "message": f"Added {name} x{qty}.", "cart": cart_data}, 200
+
+
+def _process_phone_cart_add_manual_form(form):
+    name = form.get("name", [""])[0].strip()
+    price = _to_float(form.get("price", [""])[0])
+    qty = _to_int(form.get("qty", ["1"])[0])
+
+    if not name:
+        return _phone_cart_error("Item name is required.")
+    if price is None or price < 0:
+        return _phone_cart_error("Price must be a non-negative number.")
+    if qty is None or qty <= 0:
+        return _phone_cart_error("Quantity must be a positive whole number.")
+
+    with _phone_cart_lock:
+        _phone_cart.append(
+            {
+                "id": 0,
+                "barcode": "",
+                "name": name,
+                "price": price,
+                "stock": 0,
+                "qty": int(qty),
+            }
+        )
         cart_data = _serialize_phone_cart_unlocked()
     return {"success": True, "message": f"Added {name} x{qty}.", "cart": cart_data}, 200
 
@@ -453,8 +529,10 @@ def _process_phone_cart_remove_form(form):
 
 
 def _process_phone_cart_clear():
+    global _phone_cart_discount_percent
     with _phone_cart_lock:
         _phone_cart.clear()
+        _phone_cart_discount_percent = 0.0
         cart_data = _serialize_phone_cart_unlocked()
     return {"success": True, "message": "Phone cart cleared.", "cart": cart_data}, 200
 
@@ -468,12 +546,31 @@ def _process_phone_cart_payment_mode(form):
     return {"success": True, "message": f"Payment mode set to {mode}.", "cart": cart_data}, 200
 
 
+def _process_phone_cart_discount_form(form):
+    global _phone_cart_discount_percent
+    try:
+        discount_percent = _normalize_discount_percent(form.get("discount_percent", ["0"])[0])
+    except ValueError as exc:
+        return _phone_cart_error(str(exc))
+
+    with _phone_cart_lock:
+        _phone_cart_discount_percent = discount_percent
+        cart_data = _serialize_phone_cart_unlocked()
+    return {
+        "success": True,
+        "message": f"Discount set to {discount_percent:.2f}%.",
+        "cart": cart_data,
+    }, 200
+
+
 def _process_phone_cart_complete():
+    global _phone_cart_discount_percent
     with _phone_cart_lock:
         if not _phone_cart:
             return _phone_cart_error("Phone cart is empty.")
 
         payment_mode = _phone_cart_payment_mode
+        discount_percent = round(float(_phone_cart_discount_percent), 2)
         cart_for_sale = [
             {
                 "id": int(item["id"]),
@@ -487,26 +584,41 @@ def _process_phone_cart_complete():
         cart_for_print = [dict(item) for item in cart_for_sale]
 
     try:
-        sale_result = save_sale(cart_for_sale, payment_mode=payment_mode)
+        sale_result = save_sale(cart_for_sale, payment_mode=payment_mode, discount_percent=discount_percent)
     except ValueError as exc:
         return _phone_cart_error(str(exc))
     except Exception as exc:
         return _phone_cart_error(f"Checkout failed: {exc}", status_code=500)
 
     sale_id = int(sale_result.get("sale_id", 0))
+    subtotal = float(sale_result.get("subtotal", 0.0))
+    discount_percent = float(sale_result.get("discount_percent", 0.0))
+    discount_amount = float(sale_result.get("discount_amount", 0.0))
     total = float(sale_result.get("total", 0.0))
     normalized_mode = str(sale_result.get("payment_mode", payment_mode))
 
-    print_result = print_bill(cart_for_print, total, bill_no=sale_id, payment_mode=normalized_mode)
+    print_result = print_bill(
+        cart_for_print,
+        total,
+        bill_no=sale_id,
+        payment_mode=normalized_mode,
+        subtotal=subtotal,
+        discount_percent=discount_percent,
+        discount_amount=discount_amount,
+    )
     print_message = print_result.get("message", "Sale saved.")
 
     with _phone_cart_lock:
         _phone_cart.clear()
+        _phone_cart_discount_percent = 0.0
         cart_data = _serialize_phone_cart_unlocked()
 
     return {
         "success": True,
-        "message": f"Bill #{sale_id} completed ({normalized_mode}) | Total: {total:.2f}. {print_message}",
+        "message": (
+            f"Bill #{sale_id} completed ({normalized_mode}) | Subtotal: {subtotal:.2f} | "
+            f"Discount: {discount_percent:.2f}% ({discount_amount:.2f}) | Total: {total:.2f}. {print_message}"
+        ),
         "cart": cart_data,
     }, 200
 
@@ -579,10 +691,11 @@ def _render_page(message=""):
     .cart-meta {{ color: #555; font-size: 12px; margin: 2px 0 6px; }}
     .cart-empty {{ padding: 10px; color: #555; }}
     .phone-cart-total {{ margin-top: 8px; font-weight: bold; }}
+    .discount-row {{ margin-top: 8px; }}
+    .discount-row label {{ flex: 0 0 auto; font-size: 13px; color: #333; }}
+    .discount-input {{ max-width: 110px; }}
     .phone-cart-status {{ min-height: 20px; margin-top: 8px; color: #333; }}
-    .phonepe-box {{ margin-top: 8px; border: 1px solid #e5e7eb; border-radius: 6px; background: #f3f8ff; padding: 8px; }}
-    .phonepe-hint {{ font-size: 12px; color: #444; }}
-    .phonepe-qr {{ display: block; width: 220px; height: 220px; margin: 6px auto; border: 1px solid #d6dce5; border-radius: 6px; background: #fff; object-fit: contain; }}
+
     .scan-status {{ min-height: 20px; margin: 6px 0; color: #333; }}
     .scan-actions {{ display: flex; gap: 8px; margin: 6px 0 8px; }}
     .scan-button {{ margin: 0; width: 100%; }}
@@ -606,6 +719,8 @@ def _render_page(message=""):
     .logo-image {{ width: 42px; height: 42px; object-fit: contain; display: block; filter: contrast(1.25); }}
     .message {{ font-weight: bold; margin-bottom: 10px; }}
     .page-title {{ text-align: center; margin: 0; font-size: 24px; }}
+    .phonepe-hint {{ font-size: 12px; color: #444; }}
+    .phonepe-qr {{ display: block; width: 220px; height: 220px; margin: 6px auto; border: 1px solid #d6dce5; border-radius: 6px; background: #fff; object-fit: contain; }}
   </style>
 </head>
 <body>
@@ -615,6 +730,9 @@ def _render_page(message=""):
       <h2 class="page-title">Matchless Gift Shop</h2>
     </div>
     <div class="message">{safe_message}</div>
+    <div style="font-size:12px;color:#555;margin-bottom:8px;">
+      Open this page from your phone using the URL shown in the POS terminal. Make sure the phone is on the same local network as the POS.
+    </div>
     <div class="card">
       <h3>Send Barcode To Billing</h3>
       <div class="scan-actions">
@@ -626,8 +744,9 @@ def _render_page(message=""):
         <input id="barcode-input" name="barcode" placeholder="Scan or type barcode manually" required />
         <div class="row">
           <input id="scan-qty" type="number" min="1" step="1" value="1" placeholder="Qty" />
-          <button id="add-to-phone-cart" type="submit">Add To Cart</button>
+          <button id="add-to-phone-cart" type="submit">Add To Cart (also send to POS)</button>
         </div>
+        <button id="add-manual-item" type="button" class="secondary" style="margin-top:8px;">Add Manual Item</button>
       </form>
     </div>
     <div class="card">
@@ -636,16 +755,15 @@ def _render_page(message=""):
         <button id="pay-cash" type="button" class="payment-btn">Cash</button>
         <button id="pay-online" type="button" class="payment-btn">Online</button>
       </div>
-      <div id="phone-cart-total" class="phone-cart-total">Total: 0.00</div>
-      <div class="phonepe-box">
-        <div id="phonepe-amount" class="phone-cart-total">Payable Amount: 0.00</div>
-        <img id="phonepe-qr" class="phonepe-qr" alt="PhonePe UPI QR" />
-        <div class="row">
-          <button id="phonepe-open" type="button" class="secondary">Open PhonePe</button>
-          <button id="phonepe-copy" type="button" class="secondary">Copy UPI Link</button>
-          <button id="phonepe-paid" type="button" class="success">Mark Paid (Online)</button>
-        </div>
-        <div id="phonepe-hint" class="phonepe-hint"></div>
+      <div class="row discount-row">
+        <label for="phone-discount">Discount %</label>
+        <input id="phone-discount" class="discount-input" type="number" min="0" max="100" step="0.01" value="0" />
+        <button id="phone-discount-apply" type="button" class="secondary">Apply</button>
+      </div>
+      <div id="phone-cart-total" class="phone-cart-total">Subtotal: 0.00 | Discount: 0.00% (0.00) | Total: 0.00</div>
+      <div id="online-qr-container" style="display:none; margin-top:8px; text-align:center;">
+        <img id="online-qr" class="phonepe-qr" alt="Payment QR" />
+        <div id="online-qr-hint" class="phonepe-hint"></div>
       </div>
       <div id="phone-cart-list" class="phone-cart-list">
         <div class="cart-empty">No items in phone cart.</div>
@@ -660,6 +778,9 @@ def _render_page(message=""):
   </div>
   <script>
     (function () {{
+      const PHONEPE_UPI_ID = {safe_upi_id_js};
+      const PHONEPE_UPI_NAME = {safe_upi_name_js};
+
       const barcodeInput = document.getElementById("barcode-input");
       const scanForm = document.getElementById("scan-form");
       const scanToggle = document.getElementById("scan-toggle");
@@ -673,17 +794,13 @@ def _render_page(message=""):
       const phoneCartRefreshBtn = document.getElementById("phone-cart-refresh");
       const phoneCartClearBtn = document.getElementById("phone-cart-clear");
       const phoneCartCompleteBtn = document.getElementById("phone-cart-complete");
+      const phoneDiscountInput = document.getElementById("phone-discount");
+      const phoneDiscountApplyBtn = document.getElementById("phone-discount-apply");
       const payCashBtn = document.getElementById("pay-cash");
       const payOnlineBtn = document.getElementById("pay-online");
-      const phonePeAmount = document.getElementById("phonepe-amount");
-      const phonePeHint = document.getElementById("phonepe-hint");
-      const phonePeOpenBtn = document.getElementById("phonepe-open");
-      const phonePeCopyBtn = document.getElementById("phonepe-copy");
-      const phonePePaidBtn = document.getElementById("phonepe-paid");
-      const phonePeQr = document.getElementById("phonepe-qr");
+      const addManualBtn = document.getElementById("add-manual-item");
 
-      const PHONEPE_UPI_ID = {safe_upi_id_js};
-      const PHONEPE_UPI_NAME = {safe_upi_name_js};
+
 
       let stream = null;
       let detector = null;
@@ -691,7 +808,6 @@ def _render_page(message=""):
       let scanning = false;
       let frameRequestInFlight = false;
       let scanCanvas = null;
-      let phonePeLink = "";
 
       function setStatus(text) {{
         scanStatus.textContent = text;
@@ -712,6 +828,14 @@ def _render_page(message=""):
       function asNonNegativeInt(value) {{
         const parsed = Number.parseInt(String(value || "").trim(), 10);
         if (Number.isInteger(parsed) && parsed >= 0) {{
+          return parsed;
+        }}
+        return null;
+      }}
+
+      function asDiscountPercentOrNull(value) {{
+        const parsed = Number.parseFloat(String(value || "").trim());
+        if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 100) {{
           return parsed;
         }}
         return null;
@@ -745,35 +869,29 @@ def _render_page(message=""):
         return "upi://pay?" + params.toString();
       }}
 
-      function updatePhonePeUi(total) {{
-        const payable = Number(total || 0);
-        phonePeAmount.textContent = "Payable Amount: " + payable.toFixed(2);
-
-        const upiConfigured = String(PHONEPE_UPI_ID || "").trim().length > 0 &&
-          String(PHONEPE_UPI_ID || "").toLowerCase().indexOf("your-upi-id") === -1;
-
-        if (!upiConfigured) {{
-          phonePeLink = "";
-          phonePeHint.textContent = "UPI ID is not configured in POS config.";
-          phonePeQr.removeAttribute("src");
-          phonePeOpenBtn.disabled = true;
-          phonePeCopyBtn.disabled = true;
-          phonePePaidBtn.disabled = payable <= 0;
+      function updateOnlineQr(total, mode) {{
+        const amount = Number(total || 0);
+        const container = document.getElementById("online-qr-container");
+        const hint = document.getElementById("online-qr-hint");
+        const qrImg = document.getElementById("online-qr");
+        if (mode.toLowerCase() !== "online" || amount <= 0) {{
+          container.style.display = "none";
           return;
         }}
-
-        phonePeLink = buildUpiLink(payable);
-        phonePeHint.textContent = "UPI ID: " + PHONEPE_UPI_ID;
-        const disablePay = payable <= 0;
-        if (disablePay) {{
-          phonePeQr.removeAttribute("src");
-        }} else {{
-          phonePeQr.src = "https://quickchart.io/qr?size=220&text=" + encodeURIComponent(phonePeLink);
+        const upiConfigured = String(PHONEPE_UPI_ID || "").trim().length > 0 &&
+          String(PHONEPE_UPI_ID || "").toLowerCase().indexOf("your-upi-id") === -1;
+        if (!upiConfigured) {{
+          hint.textContent = "UPI ID is not configured in POS config.";
+          container.style.display = "none";
+          return;
         }}
-        phonePeOpenBtn.disabled = disablePay;
-        phonePeCopyBtn.disabled = disablePay;
-        phonePePaidBtn.disabled = disablePay;
+        const link = buildUpiLink(amount);
+        qrImg.src = "https://quickchart.io/qr?size=220&text=" + encodeURIComponent(link);
+        hint.textContent = "UPI ID: " + PHONEPE_UPI_ID;
+        container.style.display = "block";
       }}
+
+
 
       async function postForm(url, keyValues) {{
         const params = new URLSearchParams();
@@ -824,12 +942,27 @@ def _render_page(message=""):
       }}
 
       function renderPhoneCart(payload) {{
-        const cart = payload && payload.cart ? payload.cart : {{ items: [], total: 0, payment_mode: "Cash" }};
+        const cart = payload && payload.cart ? payload.cart : {{
+          items: [],
+          subtotal: 0,
+          discount_percent: 0,
+          discount_amount: 0,
+          total: 0,
+          payment_mode: "Cash",
+        }};
         const items = Array.isArray(cart.items) ? cart.items : [];
+        const subtotal = Number(cart.subtotal || 0);
+        const discountPercent = Number(cart.discount_percent || 0);
+        const discountAmount = Number(cart.discount_amount || 0);
+        const total = Number(cart.total || 0);
 
         setPaymentButtons(cart.payment_mode || "Cash");
-        phoneCartTotal.textContent = "Total: " + Number(cart.total || 0).toFixed(2);
-        updatePhonePeUi(Number(cart.total || 0));
+        phoneDiscountInput.value = discountPercent.toFixed(2);
+        phoneCartTotal.textContent =
+          "Subtotal: " + subtotal.toFixed(2) +
+          " | Discount: " + discountPercent.toFixed(2) + "% (" + discountAmount.toFixed(2) + ")" +
+          " | Total: " + total.toFixed(2);
+        updateOnlineQr(total, cart.payment_mode || "Cash");
 
         if (items.length === 0) {{
           phoneCartList.innerHTML = '<div class="cart-empty">No items in phone cart.</div>';
@@ -912,6 +1045,36 @@ def _render_page(message=""):
         await addToPhoneCartByBarcode(barcode, qty);
       }}
 
+      async function addManualItem() {{
+        const name = prompt("Item name:");
+        if (!name) {{
+          return;
+        }}
+        const priceStr = prompt("Item price:");
+        const price = Number(priceStr);
+        if (!priceStr || isNaN(price) || price < 0) {{
+          setPhoneCartStatus("Invalid price.");
+          return;
+        }}
+        const qtyStr = prompt("Quantity:", "1");
+        const qty = parseInt(qtyStr, 10);
+        if (!qtyStr || isNaN(qty) || qty <= 0) {{
+          setPhoneCartStatus("Invalid quantity.");
+          return;
+        }}
+
+        try {{
+          const payload = await postForm("/phone-cart-add-manual", {{ name: name, price: price, qty: qty }});
+          if (!payload.success) {{
+            setPhoneCartStatus(payload.message || "Unable to add manual item.");
+            return;
+          }}
+          renderPhoneCart(payload);
+          setPhoneCartStatus(payload.message || "Manual item added.");
+        }} catch (err) {{
+          setPhoneCartStatus(getBridgeNetworkErrorMessage(err));
+        }}
+      }}
       async function setPhoneCartQty(productId, qty) {{
         try {{
           const payload = await postForm("/phone-cart-set-qty", {{
@@ -955,6 +1118,31 @@ def _render_page(message=""):
 
           renderPhoneCart(payload);
           setPhoneCartStatus(payload.message || ("Payment mode set to " + mode + "."));
+        }} catch (err) {{
+          setPhoneCartStatus(getBridgeNetworkErrorMessage(err));
+        }}
+      }}
+
+      async function setPhoneDiscount() {{
+        const discountPercent = asDiscountPercentOrNull(phoneDiscountInput.value);
+        if (discountPercent === null) {{
+          setPhoneCartStatus("Discount must be between 0 and 100.");
+          return;
+        }}
+
+        phoneDiscountInput.value = discountPercent.toFixed(2);
+
+        try {{
+          const payload = await postForm("/phone-cart-discount", {{
+            discount_percent: discountPercent,
+          }});
+          if (!payload.success) {{
+            setPhoneCartStatus(payload.message || "Unable to set discount.");
+            return;
+          }}
+
+          renderPhoneCart(payload);
+          setPhoneCartStatus(payload.message || ("Discount set to " + discountPercent.toFixed(2) + "%."));
         }} catch (err) {{
           setPhoneCartStatus(getBridgeNetworkErrorMessage(err));
         }}
@@ -1415,34 +1603,27 @@ def _render_page(message=""):
         setPhonePaymentMode("Online");
       }});
 
-      phonePeOpenBtn.addEventListener("click", function () {{
-        if (!phonePeLink) {{
-          setPhoneCartStatus("PhonePe link is unavailable.");
+      phoneDiscountApplyBtn.addEventListener("click", function () {{
+        setPhoneDiscount();
+      }});
+
+      phoneDiscountInput.addEventListener("keydown", function (event) {{
+        if (event.key !== "Enter") {{
           return;
         }}
-        window.location.href = phonePeLink;
+        event.preventDefault();
+        setPhoneDiscount();
       }});
 
-      phonePeCopyBtn.addEventListener("click", async function () {{
-        if (!phonePeLink) {{
-          setPhoneCartStatus("PhonePe link is unavailable.");
-          return;
-        }}
-        try {{
-          if (navigator.clipboard && navigator.clipboard.writeText) {{
-            await navigator.clipboard.writeText(phonePeLink);
-          }}
-          setPhoneCartStatus("UPI link copied.");
-        }} catch (_err) {{
-          setPhoneCartStatus("Unable to copy UPI link.");
+      phoneDiscountInput.addEventListener("blur", function () {{
+        if (!String(phoneDiscountInput.value || "").trim()) {{
+          phoneDiscountInput.value = "0";
         }}
       }});
 
-      phonePePaidBtn.addEventListener("click", async function () {{
-        await setPhonePaymentMode("Online");
-        setPhoneCartStatus("Marked paid in PhonePe. Payment mode is Online.");
+      addManualBtn.addEventListener("click", function () {{
+        addManualItem();
       }});
-
       phoneCartRefreshBtn.addEventListener("click", function () {{
         refreshPhoneCart("Phone cart refreshed.");
       }});
@@ -1522,6 +1703,11 @@ class _PhoneBridgeHandler(BaseHTTPRequestHandler):
             self._send_json(result, status_code=status_code)
             return
 
+        if self.path == "/phone-cart-add-manual":
+            result, status_code = _process_phone_cart_add_manual_form(form)
+            self._send_json(result, status_code=status_code)
+            return
+
         if self.path == "/phone-cart-set-qty":
             result, status_code = _process_phone_cart_set_qty_form(form)
             self._send_json(result, status_code=status_code)
@@ -1539,6 +1725,11 @@ class _PhoneBridgeHandler(BaseHTTPRequestHandler):
 
         if self.path == "/phone-cart-payment":
             result, status_code = _process_phone_cart_payment_mode(form)
+            self._send_json(result, status_code=status_code)
+            return
+
+        if self.path == "/phone-cart-discount":
+            result, status_code = _process_phone_cart_discount_form(form)
             self._send_json(result, status_code=status_code)
             return
 

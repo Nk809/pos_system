@@ -89,6 +89,14 @@ def save_sale(cart, payment_mode="Cash", discount_percent=0.0):
         sale_id = cur.lastrowid
 
         for item in normalized_cart:
+            # manual items use non-positive id; store them without stock checks
+            if int(item["id"]) <= 0:
+                cur.execute(
+                    "INSERT INTO sale_items(sale_id,product_id,quantity,price) VALUES(?,?,?,?)",
+                    (sale_id, item["id"], item["qty"], item["price"])
+                )
+                continue
+
             cur.execute("SELECT stock FROM products WHERE id = ?", (item["id"],))
             stock_row = cur.fetchone()
 

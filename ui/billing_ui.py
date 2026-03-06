@@ -1,6 +1,7 @@
 import io
 import tkinter as tk
 from datetime import datetime
+from tkinter import messagebox, simpledialog
 from pathlib import Path
 from tkinter import messagebox
 from config import APP_BACKGROUND_IMAGE, APP_LOGO_IMAGE, BASE_DIR
@@ -217,6 +218,9 @@ class BillingUI:
         tk.Button(
             cart_action_row, text="Remove Selected Item", font=self.font_base, command=self.remove_selected_cart_item
         ).pack(side=tk.LEFT)
+        tk.Button(
+            cart_action_row, text="Add Manual Item", font=self.font_base, command=self.add_manual_item
+        ).pack(side=tk.LEFT, padx=(10,0))
 
         tk.Label(cart_panel, textvariable=self.total_var, font=self.font_big, bg="#ffffff").grid(
             row=2, column=0, sticky="w", pady=(0, 6)
@@ -243,16 +247,25 @@ class BillingUI:
         )
         self.cash_button.pack(side=tk.LEFT, padx=4)
         self._default_payment_button_bg = self.cash_button.cget("bg")
+
+        # QR code display for online payments (must exist before setting mode)
+        self.qr_holder = tk.Frame(cart_panel, bg="#ffffff")
+        self.qr_holder.grid(row=5, column=0, sticky="ew", pady=(4,6))
+        self.qr_label = tk.Label(self.qr_holder, bg="#ffffff")
+        self.qr_label.pack()
+        self.qr_hint = tk.Label(self.qr_holder, font=self.font_small, bg="#ffffff")
+        self.qr_hint.pack()
+
         self.set_payment_mode("Cash")
 
         tk.Button(cart_panel, text="Complete Sale", font=self.font_heading, command=self.complete_sale).grid(
-            row=5, column=0, sticky="ew", pady=(4, 6)
+            row=6, column=0, sticky="ew", pady=(4, 6)
         )
         tk.Button(
             cart_panel, text="Receive In PhonePe", font=self.font_base, command=self.open_phonepe_collection
-        ).grid(row=6, column=0, sticky="ew", pady=(0, 6))
+        ).grid(row=7, column=0, sticky="ew", pady=(0, 6))
         tk.Label(cart_panel, textvariable=self.status_var, font=self.font_base, bg="#ffffff", anchor="w").grid(
-            row=7, column=0, sticky="ew", pady=(2, 0)
+            row=8, column=0, sticky="ew", pady=(2, 0)
         )
 
         self.refresh_cart()
@@ -355,6 +368,9 @@ class BillingUI:
             self.cash_button.config(relief=tk.SUNKEN, bg="#c8f7c5")
             self.online_button.config(relief=tk.RAISED, bg=self._default_payment_button_bg)
 
+        # ensure QR updates when mode changes
+        self.refresh_cart()
+
     def _get_discount_percent(self, show_error=False):
         raw_text = self.discount_entry.get().strip()
         if not raw_text:
@@ -372,6 +388,29 @@ class BillingUI:
             return None
 
         return round(float(value), 2)
+
+    def _update_qr_display(self, total):
+        mode = self.payment_mode.get()
+        if mode == "Online" and total > 0:
+            # build QR if UPI configured
+            try:
+                import qrcode
+                from PIL import Image, ImageTk
+                from features.phonepe_ui import _build_upi_uri
+
+                uri = _build_upi_uri(total)
+                img = qrcode.make(uri).resize((200, 200), Image.NEAREST)
+                photo = ImageTk.PhotoImage(img)
+                self.qr_label.config(image=photo)
+                self.qr_label.image = photo
+                self.qr_hint.config(text=f"UPI ID: {str(__import__('config').UPI_ID)}")
+                self.qr_holder.grid()
+            except Exception:
+                self.qr_label.config(image="")
+                self.qr_hint.config(text="QR unavailable (install qrcode/pillow)")
+                self.qr_holder.grid()
+        else:
+            self.qr_holder.grid_remove()
 
     def _calculate_bill_totals(self, show_error=False):
         subtotal = round(sum(item["total"] for item in self.cart), 2)
@@ -593,6 +632,35 @@ class BillingUI:
         self._add_by_barcode(barcode)
         self.barcode_entry.focus_set()
 
+    def add_manual_item(self):
+        # prompt user for name, price and quantity
+        name = tk.simpledialog.askstring("Manual Item", "Item name:", parent=self.root)
+        if not name:
+            return
+        try:
+            price_str = tk.simpledialog.askstring("Manual Item", "Item price:", parent=self.root)
+            price = float(price_str)
+        except Exception:
+            messagebox.showerror("Invalid Price", "Price must be a number.")
+            return
+        try:
+            qty_str = tk.simpledialog.askstring("Manual Item", "Quantity:", parent=self.root)
+            qty = int(qty_str)
+        except Exception:
+            messagebox.showerror("Invalid Quantity", "Quantity must be a whole number.")
+            return
+        if qty <= 0 or price < 0:
+            messagebox.showerror("Invalid Values", "Quantity must be positive and price cannot be negative.")
+            return
+        # insert with id zero
+        existing = next((item for item in self.cart if item.get("id", 0) == 0 and item.get("name") == name and item.get("price") == price), None)
+        if existing:
+            existing["qty"] += qty
+            existing["total"] = round(existing["qty"] * existing["price"], 2)
+        else:
+            self.cart.append({"id": 0, "name": name, "qty": qty, "price": price, "total": round(price * qty, 2)})
+        self.refresh_cart()
+
     def _add_by_barcode(self, barcode):
         if not barcode:
             return
@@ -636,6 +704,8 @@ class BillingUI:
         self.total_var.set(
             f"Subtotal: {subtotal:.2f} | Discount: {discount_percent:.2f}% ({discount_amount:.2f}) | Total: {final_total:.2f}"
         )
+        # update QR area based on current payment mode & total
+        self._update_qr_display(final_total)
 
     def remove_selected_cart_item(self, _event=None):
         selected = self.cart_listbox.curselection()

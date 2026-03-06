@@ -88,3 +88,47 @@ def delete_product(product_id):
                 conn.close()
 
     return 0
+
+
+def change_stock(barcode, delta):
+    """Adjust stock for product matching *barcode* by *delta* (can be negative).
+    Returns the new stock level or raises ValueError if the product is missing.
+    """
+    for attempt in range(MAX_DB_RETRIES):
+        conn = None
+        try:
+            conn = connect()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT stock FROM products WHERE barcode = ?",
+                (barcode,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("Product not found for barcode: %s" % barcode)
+            current = int(row[0] or 0)
+            try:
+                delta_val = int(delta)
+            except (TypeError, ValueError):
+                raise ValueError("Delta must be an integer.")
+            new_stock = current + delta_val
+            if new_stock < 0:
+                new_stock = 0
+            cur.execute(
+                "UPDATE products SET stock = ? WHERE barcode = ?",
+                (new_stock, barcode),
+            )
+            conn.commit()
+            return new_stock
+        except sqlite3.OperationalError as exc:
+            if conn is not None:
+                conn.rollback()
+            if _is_db_locked(exc) and attempt < MAX_DB_RETRIES - 1:
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+        finally:
+            if conn is not None:
+                conn.close()
+    # should never reach here
+    raise RuntimeError("Unable to change stock")
