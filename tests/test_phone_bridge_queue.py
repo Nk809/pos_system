@@ -25,6 +25,18 @@ class PhoneBridgeQueueTest(unittest.TestCase):
         self.assertEqual(second, "ABC123")
         self.assertIsNone(pop_scanned_barcode())
 
+    def test_phone_cart_add_default_qty_once(self):
+        # previous bug: UI click triggered two submissions, default qty=1
+        phone_bridge.search_product = lambda barcode: [(1, barcode, "Test", 10.0, 100)]
+        # omit qty field entirely (or let default behavior handle it)
+        form = {"barcode": ["XYZ789"]}
+        result, status = _process_phone_cart_add_form(form)
+        self.assertEqual(status, 200)
+        self.assertTrue(result.get("success", False))
+        # only one barcode should appear
+        self.assertEqual(pop_scanned_barcode(), "XYZ789")
+        self.assertIsNone(pop_scanned_barcode())
+
     def test_phone_cart_add_with_existing_item_queues_added_qty(self):
         # stub search_product
         phone_bridge.search_product = lambda barcode: [(1, barcode, "Product", 15.0, 50)]

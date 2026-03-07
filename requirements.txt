@@ -2,3 +2,6 @@
 # Barcode scanning feature dependencies:
 opencv-python
 pyzbar
+
+# web-based SQLite browser used by the application
+sqlite-web

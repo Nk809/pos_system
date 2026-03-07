@@ -60,6 +60,66 @@ python3 main.py
 On startup, terminal shows:
 - Desktop app starts
 - Phone bridge URL, for example: `https://192.168.1.19:8765`
+- (new) SQLite browser URL, for example: `http://127.0.0.1:8080` if `sqlite-web` is
+  installed
+
+## Database browser (optional)
+
+A small web interface is available via the [`sqlite-web`](https://pypi.org/project/sqlite-web/)
+package.  When the application launches it will attempt to execute the
+`sqlite_web` command with the bundled database file; the server runs in the
+background and will be automatically terminated when the main application
+exits.
+
+### Enabling the browser
+
+Install the extra dependency (now included in ``requirements.txt``):
+
+```bash
+pip install -r requirements.txt
+```
+
+or install the package manually in an existing environment:
+
+```bash
+pip install sqlite-web
+```
+
+If the package is missing, the app will simply print a message and continue
+running normally.
+
+### Accessing the interface
+
+By default the helper tries to bind to port **8080**.  If that port is
+already in use it will automatically scan upward through 8081–8090 and pick
+the first free port, printing whatever address it successfully opened.
+
+You can also force a specific port by setting the ``SQLITE_WEB_PORT``
+environment variable, e.g.::
+
+```bash
+export SQLITE_WEB_PORT=8083
+python3 main.py
+```
+
+or by passing ``--port`` when launching manually:
+
+```bash
+python -m sqlite_web --port 8083 data/pos.db
+```
+
+Open the printed URL in any browser to view/edit the database.  You can view
+table contents, edit rows, add and delete records, and execute SQL queries
+directly.
+
+Alternatively you may start the browser yourself from the command line:
+
+```bash
+python -m sqlite_web data/pos.db
+```
+
+The standalone command may be useful if you just want to poke at the file
+without launching the full POS application.
 
 ## Phone Bridge Usage
 1. Connect phone and laptop to same Wi-Fi.

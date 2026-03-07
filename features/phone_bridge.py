@@ -731,7 +731,6 @@ def _render_page(message=""):
     </div>
     <div class="message">{safe_message}</div>
     <div style="font-size:12px;color:#555;margin-bottom:8px;">
-      Open this page from your phone using the URL shown in the POS terminal. Make sure the phone is on the same local network as the POS.
     </div>
     <div class="card">
       <h3>Send Barcode To Billing</h3>
@@ -1559,14 +1558,19 @@ def _render_page(message=""):
         startScanner();
       }});
 
+      // submit handler covers both button click and enter-press within form
       scanForm.addEventListener("submit", async function (event) {{
         event.preventDefault();
         addCurrentBarcodeToPhoneCart();
       }});
 
-      addToPhoneCartBtn.addEventListener("click", function () {{
-        addCurrentBarcodeToPhoneCart();
-      }});
+      // the explicit click listener was causing the addition routine to fire
+      // twice (once for the click event and again for the form submit).  the
+      // button remains type="submit" so the submit handler is sufficient.
+      //remove this extra listener
+      // addToPhoneCartBtn.addEventListener("click", function () {{
+      //   addCurrentBarcodeToPhoneCart();
+      // }});
 
       scanQtyInput.addEventListener("keydown", function (event) {{
         if (event.key !== "Enter") {{
