@@ -1,7 +1,21 @@
-# Core POS flow uses Python standard library modules.
-# Barcode scanning feature dependencies:
+# Desktop/runtime dependencies
+pillow
+qrcode
+cairosvg
+matplotlib
+pandas
+
+# Barcode scanning feature dependencies
 opencv-python
 pyzbar
 
+# Thermal printer dependencies
+python-escpos
+pyusb
+pywin32; platform_system == "Windows"
+
 # web-based SQLite browser used by the application
 sqlite-web
+
+# Packaging
+pyinstaller

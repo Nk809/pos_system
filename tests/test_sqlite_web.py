@@ -1,10 +1,21 @@
 import os
 import unittest
+from unittest.mock import patch
 
-from features.sqlite_web import start_sqlite_web, _find_free_port
+from features.sqlite_web import _find_free_port, _sqlite_web_command, start_sqlite_web
 
 
 class SqliteWebTest(unittest.TestCase):
+    def test_sqlite_web_command_falls_back_to_module(self):
+        fake_spec = object()
+        with patch("features.sqlite_web._which", return_value=None), patch(
+            "features.sqlite_web.importlib.util.find_spec", return_value=fake_spec
+        ), patch("features.sqlite_web.sys.executable", "/tmp/python"):
+            command, error = _sqlite_web_command()
+
+        self.assertEqual(command, ["/tmp/python", "-m", "sqlite_web"])
+        self.assertIsNone(error)
+
     def test_start_returns_dict(self):
         result = start_sqlite_web(port=9999)
         self.assertIsInstance(result, dict)

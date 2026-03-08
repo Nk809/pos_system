@@ -1,54 +1,30 @@
 # POS System (Matchless Gift Shop)
 
-Desktop POS billing application with:
+Offline desktop POS billing application with:
 - Inventory management
-- Cart and checkout
-- Cash/Online payment mode
-- Thermal receipt printing
-- Phone bridge (mobile browser) for barcode scanning and cart billing
+- Barcode scanner input through USB / wireless dongle keyboard-wedge mode
+- Cash / online payment handling
+- Thermal receipt printing through Windows spooler, Wi-Fi, Bluetooth, serial, or USB
+- Local SQLite database with optional local `sqlite-web` browser
 
 ## Tech Stack
 - Python 3
-- Tkinter (desktop UI)
-- SQLite (local database)
-- HTTP/HTTPS phone bridge (built-in Python server)
-
-## Project Structure
-- `main.py` -> app entry point
-- `ui/` -> desktop UI screens
-- `services/` -> billing/product business logic
-- `features/` -> phone bridge, printing, reports, export, scanner helpers
-- `data/` -> runtime database and TLS files
-- `assets/` -> logo/image assets
-
-## Requirements
-Tested on Ubuntu with Python `3.12`.
-
-### System packages (Ubuntu)
-```bash
-sudo apt update
-sudo apt install -y python3-tk libzbar0 libgl1 openssl
-```
-
-### Python packages
-Create and activate virtual environment:
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Install dependencies:
-```bash
-pip install -r requirements.txt
-pip install matplotlib pandas pillow qrcode python-escpos cairosvg
-```
+- Tkinter
+- SQLite
 
 ## Configuration
-Edit `config.py` if needed:
-- `UPI_ID`, `UPI_PAYEE_NAME`
-- `PRINTER_VENDOR`, `PRINTER_PRODUCT` (USB thermal printer)
-- `APP_LOGO_IMAGE` (currently `assets/logo.jpeg`)
-- `APP_BACKGROUND_IMAGE` (currently empty/disabled)
+Edit `config.py` for device setup:
+- `PRINTER_MODE`: `auto`, `windows`, `network`, `wifi`, `bluetooth`, `serial`, `usb`
+- `PRINTER_WINDOWS_NAME`
+- `PRINTER_NETWORK_ADDR`
+- `PRINTER_BLUETOOTH_ADDRESS`
+- `PRINTER_BLUETOOTH_CHANNEL`
+- `PRINTER_BLUETOOTH_NAME`
+- `PRINTER_SERIAL_PORT`
+- `PRINTER_VENDOR`, `PRINTER_PRODUCT`
+- `SCANNER_NAME_HINTS`
+
+`network` and `wifi` use the same TCP printer target. Example: `192.168.0.50:9100`
 
 ## Run
 ```bash
@@ -57,126 +33,37 @@ source .venv/bin/activate
 python3 main.py
 ```
 
-On startup, terminal shows:
-- Desktop app starts
-- Phone bridge URL, for example: `https://192.168.1.19:8765`
-- (new) SQLite browser URL, for example: `http://127.0.0.1:8080` if `sqlite-web` is
-  installed
+Windows PowerShell:
+```powershell
+cd C:\path\to\pos_system
+.\.venv\Scripts\Activate.ps1
+python main.py
+```
 
-## Database browser (optional)
-
-A small web interface is available via the [`sqlite-web`](https://pypi.org/project/sqlite-web/)
-package.  When the application launches it will attempt to execute the
-`sqlite_web` command with the bundled database file; the server runs in the
-background and will be automatically terminated when the main application
-exits.
-
-### Enabling the browser
-
-Install the extra dependency (now included in ``requirements.txt``):
-
-```bash
+## Windows Build
+Build the desktop executable on a real Windows machine:
+```powershell
+cd C:\path\to\pos_system
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+python build_windows.py
 ```
 
-or install the package manually in an existing environment:
+Notes:
+- `build_windows.py` bundles `assets/` and `data/` into the executable.
+- Runtime data is stored under `%LOCALAPPDATA%\MatchlessGiftPOS`.
+- A relative `APP_LOGO_IMAGE` such as `assets/logo.jpeg` now resolves correctly in both source runs and PyInstaller builds.
 
-```bash
-pip install sqlite-web
-```
+## Scanner Notes
+- Barcode scanners connected through USB or a 2.4 GHz dongle are handled as keyboard input.
+- The desktop UI now shows scanner listener state and the last captured scan.
+- If a generic dongle does not expose a model name, add a custom hint in `SCANNER_NAME_HINTS`.
 
-If the package is missing, the app will simply print a message and continue
-running normally.
+## Printer Notes
+- `auto` prefers the first working route for the current machine.
+- Wi-Fi printers are probed over TCP before the UI marks them connected.
+- Bluetooth printers use RFCOMM when supported by the OS/Python build.
+- Windows paired printers can still be used through the Windows spooler.
 
-### Accessing the interface
-
-By default the helper tries to bind to port **8080**.  If that port is
-already in use it will automatically scan upward through 8081–8090 and pick
-the first free port, printing whatever address it successfully opened.
-
-You can also force a specific port by setting the ``SQLITE_WEB_PORT``
-environment variable, e.g.::
-
-```bash
-export SQLITE_WEB_PORT=8083
-python3 main.py
-```
-
-or by passing ``--port`` when launching manually:
-
-```bash
-python -m sqlite_web --port 8083 data/pos.db
-```
-
-Open the printed URL in any browser to view/edit the database.  You can view
-table contents, edit rows, add and delete records, and execute SQL queries
-directly.
-
-Alternatively you may start the browser yourself from the command line:
-
-```bash
-python -m sqlite_web data/pos.db
-```
-
-The standalone command may be useful if you just want to poke at the file
-without launching the full POS application.
-
-## Phone Bridge Usage
-1. Connect phone and laptop to same Wi-Fi.
-2. Open the exact URL shown in terminal on phone.
-3. For HTTPS self-signed certificate warning, open **Advanced** and proceed once.
-4. Use scanner + barcode input to add items to phone cart.  When you tap the **Add To Cart** button the barcode is also forwarded to the desktop POS, so the main billing window will receive the scanned code automatically (quantity times if >1).
-5. Select payment mode (Cash/Online), then generate bill.
-
-## Receipt Format
-Receipt includes:
-- Shop name and location
-- Date and time
-- Bill number
-- Payment mode
-- Item lines with qty and totals
-- Discount/subtotal/total (if applicable)
-
-## Data Files
-- Database: `data/pos.db`
-- Phone bridge TLS cert/key: `data/phone_bridge_tls/`
-
-## Troubleshooting
-
-### 1) `Address already in use`
-Another process is using the same port.
-```bash
-ss -ltnp | grep 8765
-kill <PID>
-python3 main.py
-```
-
-### 2) Phone cannot open bridge URL
-- Confirm both devices are on same network
-- Use exact IP and port printed by app
-- Allow firewall port:
-```bash
-sudo ufw allow 8765/tcp
-```
-
-### 3) Camera blocked in browser
-- Open HTTPS bridge URL (not HTTP)
-- Allow camera permission in mobile browser site settings
-
-### 4) `ModuleNotFoundError`
-Install missing package in active venv:
-```bash
-pip install <package-name>
-```
-
-## Git
-Initialize and push to GitHub:
-```bash
-git init
-git add .
-git commit -m "Initial commit: POS system"
-git branch -M main
-git remote add origin https://github.com/<your-username>/pos_system.git
-git push -u origin main
-```
-
+## Optional Database Browser
+The app can launch a local `sqlite-web` process for database inspection. If it is not installed, the POS still runs normally in offline mode.

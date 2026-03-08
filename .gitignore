@@ -9,6 +9,7 @@ venv/
 
 # Local database and runtime files
 data/pos.db
+data/runtime_settings.json
 data/phone_bridge_tls/
 
 # OS/editor
@@ -23,3 +24,4 @@ Thumbs.db
 build/
 dist/
 *.spec
+.wine-build/

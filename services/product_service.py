@@ -66,6 +66,54 @@ def search_product(keyword):
     return []
 
 
+def find_product_by_scanned_barcode(scanned_barcode):
+    normalized = str(scanned_barcode or "").strip()
+    if not normalized:
+        return None
+
+    for attempt in range(MAX_DB_RETRIES):
+        conn = None
+        try:
+            conn = connect()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, barcode, name, price, stock
+                FROM products
+                WHERE barcode = ?
+                LIMIT 1
+                """,
+                (normalized,),
+            )
+            exact_match = cur.fetchone()
+            if exact_match is not None:
+                return exact_match
+
+            cur.execute(
+                """
+                SELECT id, barcode, name, price, stock
+                FROM products
+                WHERE barcode IS NOT NULL
+                  AND TRIM(barcode) != ''
+                  AND ? LIKE barcode || '%'
+                ORDER BY LENGTH(barcode) DESC, name
+                LIMIT 1
+                """,
+                (normalized,),
+            )
+            return cur.fetchone()
+        except sqlite3.OperationalError as exc:
+            if _is_db_locked(exc) and attempt < MAX_DB_RETRIES - 1:
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise
+        finally:
+            if conn is not None:
+                conn.close()
+
+    return None
+
+
 def delete_product(product_id):
     for attempt in range(MAX_DB_RETRIES):
         conn = None

@@ -1,10 +1,21 @@
 import io
 import tkinter as tk
+import webbrowser
 from datetime import datetime
+from time import monotonic
 from tkinter import messagebox, simpledialog
 from pathlib import Path
-from tkinter import messagebox
-from config import APP_BACKGROUND_IMAGE, APP_LOGO_IMAGE, BASE_DIR
+from config import (
+    APP_BACKGROUND_IMAGE,
+    APP_LOGO_IMAGE,
+    BASE_DIR,
+    BUNDLED_BASE_DIR,
+    DB_PATH,
+    PRINTER_BLUETOOTH_ADDRESS,
+    PRINTER_BLUETOOTH_CHANNEL,
+    PRINTER_BLUETOOTH_NAME,
+    PRINTER_NETWORK_ADDR,
+)
 from services.billing_service import (
     clear_recent_receipts,
     get_daily_sales_summary,
@@ -12,25 +23,47 @@ from services.billing_service import (
     get_today_sales_summary,
     save_sale,
 )
-from services.product_service import delete_product, search_product
-from features.phonepe_ui import open_phonepe_payment_window
-from features.thermal_printer import print_bill
-from features.phone_bridge import pop_scanned_barcode
+from services.product_service import delete_product, find_product_by_scanned_barcode, search_product
+from features.admin_panel import open_admin_panel
+from features.device_status import (
+    connect_bluetooth_device,
+    get_device_status_snapshot,
+    set_bluetooth_radio_enabled,
+    set_wifi_radio_enabled,
+)
+from features.phonepe_ui import build_upi_qr_image, open_phonepe_payment_window
+from features.runtime_settings import get_printer_setting, update_printer_settings
+from features.scanner_utils import extract_scanned_code, parse_scanned_payload
+from features.thermal_printer import print_bill, print_test_receipt
 from features.stock_alert import low_stock
 from ui.product_ui import open_product_window
 from ui.reports_ui import reports_window
 
-
 class BillingUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.configure(bg="#f5f5f5")
+    SERVICE_PANEL_PASSCODE = "harekrishna"
 
-        main = tk.Frame(root, bg="#f5f5f5")
+    def __init__(self, root, sqlite_web=None):
+        self.root = root
+        self.root.configure(bg="#eef2f6")
+        self.root.geometry("1320x820")
+        self.root.minsize(1080, 700)
+        self.sqlite_web_info = sqlite_web or {}
+        self.printer_info = {}
+        self.device_snapshot = {}
+        self.service_links_visible = False
+        self.service_links_unlocked = False
+        self._scanner_buffer = ""
+        self._scanner_last_char_at = 0.0
+        self._scanner_max_gap_seconds = 0.08
+        self._last_scan_at = None
+        self._last_scan_value = ""
+        self.admin_panel = None
+
+        main = tk.Frame(root, bg="#eef2f6")
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.main_container = main
 
-        self._watermark_canvas = tk.Canvas(main, bg="#f5f5f5", highlightthickness=0, bd=0)
+        self._watermark_canvas = tk.Canvas(main, bg="#eef2f6", highlightthickness=0, bd=0)
         self._watermark_canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self._lower_watermark_widget()
         self.cart = []
@@ -45,16 +78,20 @@ class BillingUI:
         self._logo_image_path = self._resolve_logo_image_path()
         self._header_logo_photo = None
         self.root.bind("<Configure>", self._render_watermark_background)
+        self.root.bind_all("<KeyPress>", self._capture_usb_scanner_input, add="+")
         self.root.after(80, self._render_watermark_background)
         self.font_base = ("Arial", 11)
         self.font_heading = ("Arial", 12, "bold")
         self.font_big = ("Arial", 13, "bold")
         self.font_small = ("Arial", 10)
+        self.font_tiny = ("Arial", 8)
+        self.system_status_var = tk.StringVar(value=self._build_system_status_text())
 
         header_row = tk.Frame(main, bg="#ffffff", bd=1, relief=tk.GROOVE)
         header_row.pack(fill=tk.X, pady=(0, 6))
+        header_row.grid_columnconfigure(0, weight=1)
         header_inner = tk.Frame(header_row, bg="#ffffff")
-        header_inner.pack(pady=6)
+        header_inner.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
         self.header_logo_label = tk.Label(
             header_inner,
             text="MG",
@@ -69,13 +106,60 @@ class BillingUI:
         )
         self.header_logo_label.pack(side=tk.LEFT, padx=(0, 8))
         self._apply_header_logo_image()
-        tk.Label(
-            header_inner,
+        header_copy = tk.Frame(header_inner, bg="#ffffff")
+        header_copy.pack(side=tk.LEFT)
+        self.header_title_label = tk.Label(
+            header_copy,
             text="Matchless Gift Shop",
             font=("Arial", 16, "bold"),
             bg="#ffffff",
             fg="#1f2937",
-        ).pack(side=tk.LEFT)
+        )
+        self.header_title_label.pack(anchor="w")
+        tk.Label(
+            header_copy,
+            text="Offline billing, stock, scanner input and local printing in one screen.",
+            font=self.font_small,
+            bg="#ffffff",
+            fg="#5b6472",
+        ).pack(anchor="w", pady=(2, 0))
+
+        header_actions = tk.Frame(header_row, bg="#ffffff")
+        header_actions.grid(row=0, column=1, sticky="e", padx=12, pady=(10, 4))
+        tk.Button(
+            header_actions,
+            text="Refresh System",
+            font=self.font_base,
+            command=self.refresh_system_state,
+            bg="#13315c",
+            fg="#ffffff",
+            activebackground="#1f4b88",
+            activeforeground="#ffffff",
+            padx=12,
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+        self.service_toggle_button = tk.Button(
+            header_actions,
+            text="...",
+            width=4,
+            font=self.font_base,
+            command=self.toggle_service_links,
+            bg="#edf2f7",
+            fg="#243b53",
+        )
+        self.service_toggle_button.pack(side=tk.RIGHT)
+
+        tk.Label(
+            header_row,
+            textvariable=self.system_status_var,
+            font=self.font_small,
+            bg="#ffffff",
+            fg="#4b5563",
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 10))
+
+        self.header_logo_label.bind("<Double-Button-1>", self.toggle_service_links)
+        self.header_title_label.bind("<Double-Button-1>", self.toggle_service_links)
+        self.root.bind("<Control-Shift-L>", self.toggle_service_links)
 
         nav_row = tk.Frame(main, bg="#ffffff", bd=1, relief=tk.GROOVE)
         nav_row.pack(fill=tk.X, pady=(0, 8))
@@ -94,6 +178,34 @@ class BillingUI:
             side=tk.RIGHT, padx=(8, 12)
         )
 
+        self.service_links_panel = tk.LabelFrame(
+            main,
+            text="Database Panel",
+            font=self.font_heading,
+            bg="#f8fafc",
+            bd=1,
+            relief=tk.GROOVE,
+            labelanchor="nw",
+        )
+        self.service_links_body = tk.Frame(self.service_links_panel, bg="#f8fafc")
+        self.service_links_body.pack(fill=tk.X, padx=10, pady=(8, 10))
+        self._rebuild_service_links_panel()
+
+        self.device_status_panel = tk.LabelFrame(
+            main,
+            text="Offline Device Status",
+            font=self.font_heading,
+            bg="#ffffff",
+            bd=1,
+            relief=tk.GROOVE,
+            labelanchor="nw",
+        )
+        self.device_status_panel.pack(fill=tk.X, pady=(0, 8))
+        self.device_status_grid = tk.Frame(self.device_status_panel, bg="#ffffff")
+        self.device_status_grid.pack(fill=tk.X, padx=8, pady=(6, 6))
+        self.device_cards = {}
+        self._build_device_status_cards()
+
         receipts_card = tk.LabelFrame(
             main,
             text="Recent Payment Receipts",
@@ -104,6 +216,7 @@ class BillingUI:
             labelanchor="nw",
         )
         receipts_card.pack(fill=tk.X, pady=(0, 10))
+        self.receipts_card = receipts_card
 
         receipts_action_row = tk.Frame(receipts_card, bg="#ffffff")
         receipts_action_row.pack(fill=tk.X, padx=8, pady=(6, 4))
@@ -119,16 +232,22 @@ class BillingUI:
 
         receipts_list_row = tk.Frame(receipts_card, bg="#ffffff")
         receipts_list_row.pack(fill=tk.X, padx=8, pady=(0, 8))
-        self.receipts_listbox = tk.Listbox(receipts_list_row, height=4, font=self.font_base)
+        self.receipts_listbox = tk.Listbox(
+            receipts_list_row,
+            height=4,
+            font=self.font_base,
+            bg="#fbfdff",
+            activestyle="none",
+        )
         self.receipts_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
         receipts_scroll = tk.Scrollbar(receipts_list_row, orient=tk.VERTICAL, command=self.receipts_listbox.yview)
         receipts_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.receipts_listbox.config(yscrollcommand=receipts_scroll.set)
 
-        body_row = tk.Frame(main, bg="#f5f5f5")
+        body_row = tk.Frame(main, bg="#eef2f6")
         body_row.pack(fill=tk.BOTH, expand=True)
-        body_row.grid_columnconfigure(0, weight=5)
-        body_row.grid_columnconfigure(1, weight=4)
+        body_row.grid_columnconfigure(0, weight=11)
+        body_row.grid_columnconfigure(1, weight=10)
         body_row.grid_rowconfigure(0, weight=1)
 
         product_panel = tk.LabelFrame(
@@ -152,6 +271,8 @@ class BillingUI:
         self.barcode_entry = tk.Entry(product_panel, font=self.font_base)
         self.barcode_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         self.barcode_entry.bind("<Return>", self.handle_scanned_barcode)
+        self.barcode_entry.bind("<KP_Enter>", self.handle_scanned_barcode)
+        self.barcode_entry.bind("<Tab>", self.handle_scanned_barcode)
         self.barcode_entry.focus_set()
 
         tk.Label(product_panel, text="Search Product", font=self.font_base, bg="#ffffff").grid(
@@ -162,6 +283,7 @@ class BillingUI:
         search_box_row.grid_columnconfigure(0, weight=1)
         self.search_entry = tk.Entry(search_box_row, font=self.font_base)
         self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.search_entry.bind("<Return>", self.handle_search_submit)
         tk.Button(search_box_row, text="Search", font=self.font_base, command=self.search_products).grid(
             row=0, column=1, sticky="e"
         )
@@ -172,6 +294,7 @@ class BillingUI:
         self.quantity_entry = tk.Entry(quantity_row, width=6, font=self.font_base)
         self.quantity_entry.insert(0, "1")
         self.quantity_entry.pack(side=tk.LEFT)
+        self.quantity_entry.bind("<Return>", self.handle_quantity_submit)
         tk.Button(quantity_row, text="Add To Cart", font=self.font_base, command=self.add_to_cart).pack(
             side=tk.LEFT, padx=10
         )
@@ -183,6 +306,8 @@ class BillingUI:
         self.results_listbox = tk.Listbox(product_list_row, font=self.font_base)
         self.results_listbox.grid(row=0, column=0, sticky="nsew")
         self.results_listbox.bind("<Delete>", self.delete_selected_product_from_inventory)
+        self.results_listbox.bind("<Double-Button-1>", self.handle_results_activate)
+        self.results_listbox.bind("<Return>", self.handle_results_activate)
         results_scroll = tk.Scrollbar(product_list_row, orient=tk.VERTICAL, command=self.results_listbox.yview)
         results_scroll.grid(row=0, column=1, sticky="ns")
         self.results_listbox.config(yscrollcommand=results_scroll.set)
@@ -219,15 +344,32 @@ class BillingUI:
             cart_action_row, text="Remove Selected Item", font=self.font_base, command=self.remove_selected_cart_item
         ).pack(side=tk.LEFT)
         tk.Button(
-            cart_action_row, text="Add Manual Item", font=self.font_base, command=self.add_manual_item
-        ).pack(side=tk.LEFT, padx=(10,0))
+            cart_action_row, text="Clear Cart", font=self.font_base, command=self.clear_cart
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        manual_row = tk.Frame(cart_panel, bg="#ffffff")
+        manual_row.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        manual_row.grid_columnconfigure(1, weight=1)
+        tk.Label(manual_row, text="Manual Item", font=self.font_small, bg="#ffffff").grid(row=0, column=0, padx=(0, 6))
+        self.manual_name_entry = tk.Entry(manual_row, font=self.font_small)
+        self.manual_name_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.manual_price_entry = tk.Entry(manual_row, width=8, font=self.font_small)
+        self.manual_price_entry.grid(row=0, column=2, padx=(0, 6))
+        self.manual_price_entry.insert(0, "0")
+        self.manual_qty_entry = tk.Entry(manual_row, width=6, font=self.font_small)
+        self.manual_qty_entry.grid(row=0, column=3, padx=(0, 6))
+        self.manual_qty_entry.insert(0, "1")
+        tk.Button(manual_row, text="Quick Add", font=self.font_small, command=self.add_manual_item).grid(row=0, column=4)
+        self.manual_name_entry.bind("<Return>", lambda event: self._focus_widget(self.manual_price_entry))
+        self.manual_price_entry.bind("<Return>", lambda event: self._focus_widget(self.manual_qty_entry))
+        self.manual_qty_entry.bind("<Return>", self.add_manual_item)
 
         tk.Label(cart_panel, textvariable=self.total_var, font=self.font_big, bg="#ffffff").grid(
-            row=2, column=0, sticky="w", pady=(0, 6)
+            row=3, column=0, sticky="w", pady=(0, 6)
         )
 
         discount_row = tk.Frame(cart_panel, bg="#ffffff")
-        discount_row.grid(row=3, column=0, sticky="w", pady=(0, 6))
+        discount_row.grid(row=4, column=0, sticky="w", pady=(0, 6))
         tk.Label(discount_row, text="Discount %", font=self.font_base, bg="#ffffff").pack(side=tk.LEFT, padx=(0, 8))
         self.discount_entry = tk.Entry(discount_row, width=8, font=self.font_base)
         self.discount_entry.pack(side=tk.LEFT)
@@ -236,7 +378,7 @@ class BillingUI:
         self.discount_entry.bind("<FocusOut>", lambda _event: self.refresh_cart())
 
         payment_row = tk.Frame(cart_panel, bg="#ffffff")
-        payment_row.grid(row=4, column=0, sticky="w", pady=(2, 6))
+        payment_row.grid(row=5, column=0, sticky="w", pady=(2, 6))
         tk.Label(payment_row, text="Payment Mode", font=self.font_base, bg="#ffffff").pack(side=tk.LEFT, padx=(0, 8))
         self.online_button = tk.Button(
             payment_row, text="Online", width=10, font=self.font_base, command=lambda: self.set_payment_mode("Online")
@@ -250,7 +392,7 @@ class BillingUI:
 
         # QR code display for online payments (must exist before setting mode)
         self.qr_holder = tk.Frame(cart_panel, bg="#ffffff")
-        self.qr_holder.grid(row=5, column=0, sticky="ew", pady=(4,6))
+        self.qr_holder.grid(row=6, column=0, sticky="ew", pady=(4,6))
         self.qr_label = tk.Label(self.qr_holder, bg="#ffffff")
         self.qr_label.pack()
         self.qr_hint = tk.Label(self.qr_holder, font=self.font_small, bg="#ffffff")
@@ -259,18 +401,18 @@ class BillingUI:
         self.set_payment_mode("Cash")
 
         tk.Button(cart_panel, text="Complete Sale", font=self.font_heading, command=self.complete_sale).grid(
-            row=6, column=0, sticky="ew", pady=(4, 6)
+            row=7, column=0, sticky="ew", pady=(4, 6)
         )
         tk.Button(
             cart_panel, text="Receive In PhonePe", font=self.font_base, command=self.open_phonepe_collection
-        ).grid(row=7, column=0, sticky="ew", pady=(0, 6))
+        ).grid(row=8, column=0, sticky="ew", pady=(0, 6))
         tk.Label(cart_panel, textvariable=self.status_var, font=self.font_base, bg="#ffffff", anchor="w").grid(
-            row=8, column=0, sticky="ew", pady=(2, 0)
+            row=9, column=0, sticky="ew", pady=(2, 0)
         )
 
         self.refresh_cart()
         self.refresh_receipts_box()
-        self.root.after(500, self.poll_phone_scans)
+        self.refresh_device_status(update_status=False)
 
     def _render_watermark_background(self, _event=None):
         width = max(self.main_container.winfo_width(), 900)
@@ -293,20 +435,25 @@ class BillingUI:
         if not raw_path:
             return None
 
-        image_path = Path(raw_path)
-        if not image_path.is_absolute():
-            image_path = BASE_DIR / image_path
-        return image_path
+        return self._resolve_runtime_asset_path(raw_path)
 
     def _resolve_logo_image_path(self):
         raw_path = str(APP_LOGO_IMAGE or "").strip()
         if not raw_path:
             return None
 
-        image_path = Path(raw_path)
-        if not image_path.is_absolute():
-            image_path = BASE_DIR / image_path
-        return image_path
+        return self._resolve_runtime_asset_path(raw_path)
+
+    def _resolve_runtime_asset_path(self, raw_path):
+        image_path = Path(raw_path).expanduser()
+        if image_path.is_absolute():
+            return image_path
+
+        bundled_path = BUNDLED_BASE_DIR / image_path
+        if bundled_path.exists():
+            return bundled_path
+
+        return BASE_DIR / image_path
 
     def _apply_header_logo_image(self):
         if not self._logo_image_path or not self._logo_image_path.exists():
@@ -357,6 +504,468 @@ class BillingUI:
         except Exception:
             return False
 
+    def _build_device_status_cards(self):
+        definitions = [
+            ("scanner", "Scanner", None),
+            ("printer", "Printer", None),
+            ("wifi_route", "Wi-Fi Printer", self.connect_wifi_printer),
+            ("bluetooth_route", "Bluetooth Printer", self.connect_bluetooth_printer),
+            ("wifi_radio", "Wi-Fi Radio", self.enable_wifi_radio),
+            ("bluetooth_radio", "Bluetooth Radio", self.enable_bluetooth_radio),
+        ]
+
+        for index, (key, title, action_command) in enumerate(definitions):
+            row = 0
+            column = index
+            self.device_status_grid.grid_columnconfigure(column, weight=1)
+
+            card = tk.Frame(self.device_status_grid, bg="#f8fafc", bd=1, relief=tk.GROOVE)
+            card.grid(row=row, column=column, sticky="nsew", padx=3, pady=3)
+
+            top_row = tk.Frame(card, bg="#f8fafc")
+            top_row.pack(fill=tk.X, padx=6, pady=(4, 1))
+            tk.Label(top_row, text=title, font=self.font_tiny, bg="#f8fafc", fg="#4b5563").pack(side=tk.LEFT)
+            state_label = tk.Label(top_row, text="Checking...", font=("Arial", 9, "bold"), bg="#f8fafc", fg="#1f2937")
+            state_label.pack(side=tk.RIGHT)
+            message_label = tk.Label(
+                card,
+                text="",
+                font=self.font_tiny,
+                bg="#f8fafc",
+                fg="#1f2937",
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=130,
+            )
+            message_label.pack(anchor="w", fill=tk.X, padx=6, pady=(0, 1))
+
+            footer_row = tk.Frame(card, bg="#f8fafc")
+            footer_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+            detail_label = tk.Label(
+                footer_row,
+                text="",
+                font=self.font_tiny,
+                bg="#f8fafc",
+                fg="#5b6472",
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=88,
+            )
+            detail_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            action_button = None
+            if action_command is not None:
+                action_button = tk.Button(
+                    footer_row,
+                    text="Connect",
+                    font=self.font_tiny,
+                    command=action_command,
+                    padx=6,
+                    pady=0,
+                )
+                action_button.pack(side=tk.RIGHT, padx=(4, 0))
+
+            self.device_cards[key] = {
+                "frame": card,
+                "state": state_label,
+                "message": message_label,
+                "detail": detail_label,
+                "action": action_button,
+            }
+
+    def _device_state_color(self, state_text):
+        normalized = str(state_text or "").strip().lower()
+        if normalized in {"connected", "ready", "on"}:
+            return "#0a7b24"
+        if normalized in {"listening", "configured", "unknown"}:
+            return "#9a6700"
+        return "#b42318"
+
+    def _set_device_card(self, key, state, message, detail=""):
+        widgets = self.device_cards.get(key)
+        if not widgets:
+            return
+        widgets["state"].config(text=state, fg=self._device_state_color(state))
+        widgets["message"].config(text=self._short_status_text(message, 28))
+        widgets["detail"].config(text=self._short_status_text(detail, 18))
+
+    def _set_device_action(self, key, text, enabled=True):
+        widgets = self.device_cards.get(key) or {}
+        action_button = widgets.get("action")
+        if action_button is None:
+            return
+        action_button.config(text=text, state=(tk.NORMAL if enabled else tk.DISABLED))
+
+    def _short_status_text(self, text, limit):
+        clean_text = " ".join(str(text or "").split())
+        if len(clean_text) <= limit:
+            return clean_text
+        return clean_text[: max(limit - 3, 0)] + "..."
+
+    def _record_scanner_activity(self, barcode):
+        clean_barcode = str(barcode or "").strip()
+        if not clean_barcode:
+            return
+        self._last_scan_at = datetime.now()
+        self._last_scan_value = clean_barcode
+        self.refresh_device_status(update_status=False)
+
+    def refresh_device_status(self, update_status=True):
+        self.device_snapshot = get_device_status_snapshot(
+            last_scan_at=self._last_scan_at,
+            last_scan_value=self._last_scan_value,
+        )
+        self.printer_info = dict(self.device_snapshot.get("printer") or {})
+
+        scanner = self.device_snapshot.get("scanner") or {}
+        scanner_detail = str(scanner.get("detail") or "").strip()
+        last_scan_value = str(scanner.get("last_scan_value") or "").strip()
+        if last_scan_value:
+            scanner_detail = f"{scanner_detail} | Last code: {last_scan_value}"
+        self._set_device_card(
+            "scanner",
+            scanner.get("state", "Listening"),
+            scanner.get("message", "Scanner listener is enabled."),
+            scanner_detail,
+        )
+
+        active_printer_state = "Ready" if self.printer_info.get("success") else "Offline"
+        active_printer_detail = f"Mode: {str(self.printer_info.get('mode') or 'auto').upper()}"
+        self._set_device_card(
+            "printer",
+            active_printer_state,
+            self.printer_info.get("message", "Printer status unavailable."),
+            active_printer_detail,
+        )
+
+        printer_routes = self.device_snapshot.get("printer_routes") or {}
+        wifi_route = printer_routes.get("wifi") or {}
+        wifi_state = "Connected" if wifi_route.get("connected") else ("Configured" if wifi_route.get("configured") else "Offline")
+        self._set_device_card(
+            "wifi_route",
+            wifi_state,
+            wifi_route.get("message", "Wi-Fi printer status unavailable."),
+            ", ".join(wifi_route.get("candidates", [])[:2]),
+        )
+
+        bluetooth_route = printer_routes.get("bluetooth") or {}
+        bluetooth_state = (
+            "Connected"
+            if bluetooth_route.get("connected")
+            else ("Configured" if bluetooth_route.get("configured") else "Offline")
+        )
+        self._set_device_card(
+            "bluetooth_route",
+            bluetooth_state,
+            bluetooth_route.get("message", "Bluetooth printer status unavailable."),
+            ", ".join(bluetooth_route.get("candidates", [])[:2]),
+        )
+
+        wifi_radio = self.device_snapshot.get("wifi_radio") or {}
+        self._set_device_card(
+            "wifi_radio",
+            wifi_radio.get("state", "Unknown"),
+            wifi_radio.get("message", "Wi-Fi radio status unavailable."),
+        )
+
+        bluetooth_radio = self.device_snapshot.get("bluetooth_radio") or {}
+        self._set_device_card(
+            "bluetooth_radio",
+            bluetooth_radio.get("state", "Unknown"),
+            bluetooth_radio.get("message", "Bluetooth radio status unavailable."),
+        )
+        self._set_device_action("wifi_route", "Change" if wifi_route.get("configured") else "Connect")
+        self._set_device_action("bluetooth_route", "Change" if bluetooth_route.get("configured") else "Connect")
+        self._set_device_action("wifi_radio", "On" if wifi_radio.get("connected") else "Turn On", not wifi_radio.get("connected"))
+        self._set_device_action(
+            "bluetooth_radio",
+            "On" if bluetooth_radio.get("connected") else "Turn On",
+            not bluetooth_radio.get("connected"),
+        )
+
+        self.system_status_var.set(self._build_system_status_text())
+        if self.service_links_visible:
+            self._rebuild_service_links_panel()
+        if update_status:
+            self.status_var.set("Device status refreshed.")
+
+    def _build_system_status_text(self):
+        sqlite_ready = bool(self.sqlite_web_info.get("success"))
+        scanner_state = str((self.device_snapshot.get("scanner") or {}).get("state") or "Listening")
+        wifi_ready = bool(((self.device_snapshot.get("printer_routes") or {}).get("wifi") or {}).get("connected"))
+        bluetooth_ready = bool(((self.device_snapshot.get("printer_routes") or {}).get("bluetooth") or {}).get("connected"))
+        printer_ready = bool(self.printer_info.get("success"))
+        sqlite_label = "live" if sqlite_ready and self.sqlite_web_info.get("url") else "offline"
+        printer_label = "ready" if printer_ready else "offline"
+        wifi_label = "connected" if wifi_ready else "offline"
+        bluetooth_label = "connected" if bluetooth_ready else "offline"
+        return (
+            f"System status | Database browser: {sqlite_label} | "
+            f"Scanner: {scanner_state.lower()} | Printer: {printer_label} | "
+            f"Wi-Fi printer: {wifi_label} | Bluetooth printer: {bluetooth_label}"
+        )
+
+    def _service_link_rows(self):
+        rows = []
+
+        sqlite_url = str(self.sqlite_web_info.get("url") or "").strip()
+        if sqlite_url:
+            rows.append(("Database Browser", sqlite_url, True))
+        else:
+            rows.append(
+                (
+                    "Database Browser",
+                    str(self.sqlite_web_info.get("message") or "sqlite-web is not available on this device."),
+                    False,
+                )
+            )
+
+        rows.append(("Database File", str(DB_PATH), False))
+        return rows
+
+    def _rebuild_service_links_panel(self):
+        for child in self.service_links_body.winfo_children():
+            child.destroy()
+
+        printer_action_row = tk.Frame(self.service_links_body, bg="#f8fafc")
+        printer_action_row.pack(fill=tk.X, pady=(0, 6))
+        tk.Button(
+            printer_action_row,
+            text="Open Admin Panel",
+            font=self.font_small,
+            command=self.open_admin_panel,
+        ).pack(side=tk.LEFT)
+
+        for label_text, value_text, is_url in self._service_link_rows():
+            row = tk.Frame(self.service_links_body, bg="#f8fafc")
+            row.pack(fill=tk.X, pady=3)
+            tk.Label(
+                row,
+                text=label_text,
+                width=17,
+                anchor="w",
+                font=self.font_small,
+                bg="#f8fafc",
+                fg="#243b53",
+            ).pack(side=tk.LEFT)
+
+            value_entry = tk.Entry(row, font=self.font_small, relief=tk.FLAT, bd=1)
+            value_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=4)
+            value_entry.insert(0, value_text)
+            value_entry.config(state="readonly", readonlybackground="#ffffff")
+
+            tk.Button(
+                row,
+                text="Copy",
+                font=self.font_small,
+                command=lambda text=value_text: self.copy_to_clipboard(text),
+            ).pack(side=tk.RIGHT, padx=(4, 0))
+
+            if is_url:
+                tk.Button(
+                    row,
+                    text="Open",
+                    font=self.font_small,
+                    command=lambda url=value_text: self.open_service_link(url),
+                ).pack(side=tk.RIGHT)
+
+    def _current_network_target(self):
+        return str(get_printer_setting("network_address", PRINTER_NETWORK_ADDR) or "").strip()
+
+    def _current_bluetooth_address(self):
+        return str(get_printer_setting("bluetooth_address", PRINTER_BLUETOOTH_ADDRESS) or "").strip()
+
+    def _current_bluetooth_name(self):
+        return str(get_printer_setting("bluetooth_name", PRINTER_BLUETOOTH_NAME) or "").strip()
+
+    def _current_bluetooth_channel(self):
+        return str(get_printer_setting("bluetooth_channel", PRINTER_BLUETOOTH_CHANNEL) or "1").strip() or "1"
+
+    def connect_wifi_printer(self):
+        target = simpledialog.askstring(
+            "Wi-Fi Printer",
+            "Enter Wi-Fi printer IP or host[:port]:",
+            parent=self.root,
+            initialvalue=self._current_network_target(),
+        )
+        if target is None:
+            self.status_var.set("Wi-Fi printer setup cancelled.")
+            return
+
+        target = str(target).strip()
+        update_printer_settings(network_address=target)
+        self.refresh_device_status(update_status=False)
+        wifi_route = ((self.device_snapshot.get("printer_routes") or {}).get("wifi") or {})
+        if target:
+            self.status_var.set(wifi_route.get("message", f"Saved Wi-Fi printer target {target}."))
+        else:
+            self.status_var.set("Wi-Fi printer target cleared.")
+
+    def connect_bluetooth_printer(self):
+        address = simpledialog.askstring(
+            "Bluetooth Printer",
+            "Enter Bluetooth printer address:",
+            parent=self.root,
+            initialvalue=self._current_bluetooth_address(),
+        )
+        if address is None:
+            self.status_var.set("Bluetooth printer setup cancelled.")
+            return
+
+        address = str(address).strip()
+        if not address:
+            messagebox.showerror("Bluetooth Printer", "Bluetooth address is required.", parent=self.root)
+            return
+
+        name = simpledialog.askstring(
+            "Bluetooth Printer",
+            "Enter Bluetooth printer name (optional):",
+            parent=self.root,
+            initialvalue=self._current_bluetooth_name(),
+        )
+        if name is None:
+            self.status_var.set("Bluetooth printer setup cancelled.")
+            return
+
+        channel_text = simpledialog.askstring(
+            "Bluetooth Printer",
+            "Enter Bluetooth RFCOMM channel:",
+            parent=self.root,
+            initialvalue=self._current_bluetooth_channel(),
+        )
+        if channel_text is None:
+            self.status_var.set("Bluetooth printer setup cancelled.")
+            return
+
+        try:
+            channel = int(str(channel_text).strip() or "1")
+            if channel <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Bluetooth Printer", "Bluetooth channel must be a positive whole number.", parent=self.root)
+            return
+
+        update_printer_settings(
+            bluetooth_address=address,
+            bluetooth_name=str(name).strip(),
+            bluetooth_channel=str(channel),
+        )
+        connect_result = connect_bluetooth_device(address)
+        self.refresh_device_status(update_status=False)
+        bluetooth_route = ((self.device_snapshot.get("printer_routes") or {}).get("bluetooth") or {})
+        self.status_var.set(connect_result.get("message") or bluetooth_route.get("message", "Bluetooth printer updated."))
+
+    def enable_wifi_radio(self):
+        result = set_wifi_radio_enabled(True)
+        self.refresh_device_status(update_status=False)
+        self.status_var.set(result.get("message", "Wi-Fi radio updated."))
+
+    def enable_bluetooth_radio(self):
+        result = set_bluetooth_radio_enabled(True)
+        self.refresh_device_status(update_status=False)
+        self.status_var.set(result.get("message", "Bluetooth radio updated."))
+
+    def toggle_service_links(self, _event=None):
+        if self.service_links_visible:
+            self.service_links_visible = False
+            self.service_links_panel.pack_forget()
+            self.service_toggle_button.config(text="...")
+            self.status_var.set("Database panel hidden.")
+            return
+
+        if not self.service_links_unlocked:
+            passcode = simpledialog.askstring(
+                "Passcode Required",
+                "Enter passcode to open the database panel:",
+                parent=self.root,
+                show="*",
+            )
+            if passcode is None:
+                self.status_var.set("Database panel locked.")
+                return
+            if str(passcode).strip() != self.SERVICE_PANEL_PASSCODE:
+                messagebox.showerror("Access Denied", "Incorrect passcode.")
+                self.status_var.set("Database panel locked.")
+                return
+            self.service_links_unlocked = True
+
+        self.service_links_visible = True
+        self._rebuild_service_links_panel()
+        self.service_links_panel.pack(fill=tk.X, pady=(0, 8), before=self.receipts_card)
+        self.service_toggle_button.config(text="x")
+        self.status_var.set("Database panel unlocked.")
+
+    def _prompt_service_passcode(self):
+        passcode = simpledialog.askstring(
+            "Passcode Required",
+            "Enter passcode to open the hidden database panel:",
+            parent=self.root,
+            show="*",
+        )
+        if passcode is None:
+            self.status_var.set("Database panel locked.")
+            return False
+        if str(passcode).strip() != self.SERVICE_PANEL_PASSCODE:
+            messagebox.showerror("Access Denied", "Incorrect passcode.")
+            self.status_var.set("Database panel locked.")
+            return False
+        self.service_links_unlocked = True
+        return True
+
+    def open_protected_system(self):
+        if not self.service_links_unlocked and not self._prompt_service_passcode():
+            return
+
+        self.service_links_visible = True
+        self._rebuild_service_links_panel()
+        self.service_links_panel.pack(fill=tk.X, pady=(0, 8), before=self.receipts_card)
+        self.service_toggle_button.config(text="x")
+        self.open_admin_panel()
+        self.refresh_system_state()
+
+    def copy_to_clipboard(self, value):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(value)
+        self.status_var.set("Copied system details to clipboard.")
+
+    def open_service_link(self, url):
+        try:
+            webbrowser.open_new_tab(url)
+            self.status_var.set(f"Opened: {url}")
+        except Exception as exc:
+            messagebox.showerror("Open Link Failed", str(exc))
+
+    def refresh_system_state(self, _event=None):
+        self._scanner_buffer = ""
+        self._scanner_last_char_at = 0.0
+        self.refresh_device_status(update_status=False)
+        self.refresh_cart()
+        self.refresh_receipts_box()
+        self.search_products()
+        self._rebuild_service_links_panel()
+        self.root.update_idletasks()
+        self.system_status_var.set(self._build_system_status_text())
+        self.status_var.set("System refreshed.")
+        self.barcode_entry.focus_set()
+        return "break"
+
+    def refresh_printer_status(self, update_status=True):
+        self.refresh_device_status(update_status=False)
+        if update_status:
+            self.status_var.set(self.printer_info.get("message", "Printer status updated."))
+
+    def run_printer_test(self):
+        self.refresh_printer_status(update_status=False)
+        result = print_test_receipt()
+        self.refresh_printer_status(update_status=False)
+        if result.get("success"):
+            self.status_var.set(result.get("message", "Printer test completed."))
+            messagebox.showinfo("Printer Test", result.get("message", "Printer test completed."))
+            return
+
+        self.status_var.set(result.get("message", "Printer test failed."))
+        messagebox.showwarning("Printer Test", result.get("message", "Printer test failed."))
+
     def set_payment_mode(self, mode):
         selected_mode = "Online" if str(mode).strip().lower() == "online" else "Cash"
         self.payment_mode.set(selected_mode)
@@ -392,24 +1001,22 @@ class BillingUI:
     def _update_qr_display(self, total):
         mode = self.payment_mode.get()
         if mode == "Online" and total > 0:
-            # build QR if UPI configured
-            try:
-                import qrcode
-                from PIL import Image, ImageTk
-                from features.phonepe_ui import _build_upi_uri
+            qr_result = build_upi_qr_image(total, size=200)
+            if qr_result.get("success"):
+                from PIL import ImageTk
 
-                uri = _build_upi_uri(total)
-                img = qrcode.make(uri).resize((200, 200), Image.NEAREST)
-                photo = ImageTk.PhotoImage(img)
+                photo = ImageTk.PhotoImage(qr_result["image"])
                 self.qr_label.config(image=photo)
                 self.qr_label.image = photo
-                self.qr_hint.config(text=f"UPI ID: {str(__import__('config').UPI_ID)}")
-                self.qr_holder.grid()
-            except Exception:
+                self.qr_hint.config(text=f"Scan to pay | UPI ID: {qr_result.get('upi_id')}")
+            else:
                 self.qr_label.config(image="")
-                self.qr_hint.config(text="QR unavailable (install qrcode/pillow)")
-                self.qr_holder.grid()
+                self.qr_label.image = None
+                self.qr_hint.config(text=qr_result.get("message", "QR unavailable."))
+            self.qr_holder.grid()
         else:
+            self.qr_label.config(image="")
+            self.qr_label.image = None
             self.qr_holder.grid_remove()
 
     def _calculate_bill_totals(self, show_error=False):
@@ -488,6 +1095,51 @@ class BillingUI:
         self.refresh_receipts_box()
         self.barcode_entry.focus_set()
 
+    def _widget_accepts_free_text(self, widget):
+        if widget is None:
+            return False
+        try:
+            return widget.winfo_class() in {"Entry", "Text", "Spinbox", "TEntry", "TSpinbox"}
+        except Exception:
+            return False
+
+    def _capture_usb_scanner_input(self, event):
+        widget = event.widget
+        if self._widget_accepts_free_text(widget):
+            self._scanner_buffer = ""
+            return None
+
+        state = int(getattr(event, "state", 0) or 0)
+        if state & 0x4 or state & 0x8:
+            self._scanner_buffer = ""
+            return None
+
+        key = str(getattr(event, "keysym", "") or "")
+        char = str(getattr(event, "char", "") or "")
+        now = monotonic()
+
+        if key in {"Return", "KP_Enter", "Tab"}:
+            scan_value = self._scanner_buffer.strip()
+            self._scanner_buffer = ""
+            if len(scan_value) >= 4:
+                self._record_scanner_activity(scan_value)
+                self._add_by_barcode(scan_value)
+                self.barcode_entry.focus_set()
+                return "break"
+            return None
+
+        if len(char) != 1 or not char.isprintable() or char in "\r\n\t":
+            if now - self._scanner_last_char_at > self._scanner_max_gap_seconds:
+                self._scanner_buffer = ""
+            return None
+
+        if now - self._scanner_last_char_at > self._scanner_max_gap_seconds:
+            self._scanner_buffer = char
+        else:
+            self._scanner_buffer += char
+        self._scanner_last_char_at = now
+        return None
+
     def _format_sales_date(self, date_text):
         try:
             date_obj = datetime.strptime(str(date_text), "%Y-%m-%d")
@@ -541,6 +1193,11 @@ class BillingUI:
                 f"ID {product_id} | {name} | Barcode: {barcode_text} | Price: {price:.2f} | Stock: {stock}",
             )
 
+        if self.search_results:
+            self.results_listbox.selection_clear(0, tk.END)
+            self.results_listbox.selection_set(0)
+            self.results_listbox.activate(0)
+
     def add_to_cart(self):
         selected = self.results_listbox.curselection()
         if not selected:
@@ -558,7 +1215,11 @@ class BillingUI:
             return
 
         product_id, _barcode, name, price, stock = self.search_results[selected[0]]
-        self._add_product_to_cart(product_id, name, price, stock, qty)
+        if self._add_product_to_cart(product_id, name, price, stock, qty):
+            self.quantity_entry.delete(0, tk.END)
+            self.quantity_entry.insert(0, "1")
+            self.search_entry.focus_set()
+            self.search_entry.selection_range(0, tk.END)
 
     def delete_selected_product_from_inventory(self, _event=None):
         selected = self.results_listbox.curselection()
@@ -629,30 +1290,37 @@ class BillingUI:
     def handle_scanned_barcode(self, _event=None):
         barcode = self.barcode_entry.get().strip()
         self.barcode_entry.delete(0, tk.END)
+        self._record_scanner_activity(barcode)
         self._add_by_barcode(barcode)
         self.barcode_entry.focus_set()
+        return "break"
 
-    def add_manual_item(self):
-        # prompt user for name, price and quantity
-        name = tk.simpledialog.askstring("Manual Item", "Item name:", parent=self.root)
+    def add_manual_item(self, _event=None):
+        name = self.manual_name_entry.get().strip()
         if not name:
+            self.status_var.set("Enter a manual item name.")
+            self.manual_name_entry.focus_set()
             return
+
         try:
-            price_str = tk.simpledialog.askstring("Manual Item", "Item price:", parent=self.root)
-            price = float(price_str)
+            price = float(self.manual_price_entry.get().strip())
         except Exception:
-            messagebox.showerror("Invalid Price", "Price must be a number.")
+            self.status_var.set("Manual item price must be a number.")
+            self.manual_price_entry.focus_set()
             return
+
         try:
-            qty_str = tk.simpledialog.askstring("Manual Item", "Quantity:", parent=self.root)
-            qty = int(qty_str)
+            qty = int(self.manual_qty_entry.get().strip())
         except Exception:
-            messagebox.showerror("Invalid Quantity", "Quantity must be a whole number.")
+            self.status_var.set("Manual item quantity must be a whole number.")
+            self.manual_qty_entry.focus_set()
             return
+
         if qty <= 0 or price < 0:
-            messagebox.showerror("Invalid Values", "Quantity must be positive and price cannot be negative.")
+            self.status_var.set("Manual item quantity must be positive and price cannot be negative.")
+            self.manual_name_entry.focus_set()
             return
-        # insert with id zero
+
         existing = next((item for item in self.cart if item.get("id", 0) == 0 and item.get("name") == name and item.get("price") == price), None)
         if existing:
             existing["qty"] += qty
@@ -660,36 +1328,44 @@ class BillingUI:
         else:
             self.cart.append({"id": 0, "name": name, "qty": qty, "price": price, "total": round(price * qty, 2)})
         self.refresh_cart()
+        self.manual_name_entry.delete(0, tk.END)
+        self.manual_price_entry.delete(0, tk.END)
+        self.manual_price_entry.insert(0, "0")
+        self.manual_qty_entry.delete(0, tk.END)
+        self.manual_qty_entry.insert(0, "1")
+        self.manual_name_entry.focus_set()
+        return "break"
 
     def _add_by_barcode(self, barcode):
-        if not barcode:
+        normalized_barcode = extract_scanned_code(barcode)
+        if not normalized_barcode:
             return
 
-        candidates = search_product(barcode)
-        if not candidates:
-            self.status_var.set(f"Barcode not found: {barcode}")
+        scanned_details = parse_scanned_payload(barcode)
+        requested_qty = scanned_details.get("qty")
+        if requested_qty is None:
+            requested_qty = 1
+        try:
+            requested_qty = int(requested_qty)
+        except (TypeError, ValueError):
+            requested_qty = 1
+        if requested_qty <= 0:
+            requested_qty = 1
+
+        product = find_product_by_scanned_barcode(normalized_barcode)
+        if not product:
+            self.status_var.set(f"Barcode not found: {normalized_barcode}")
             return
 
-        exact = [row for row in candidates if (row[1] or "").strip() == barcode]
-        product = exact[0] if exact else candidates[0]
         product_id, _barcode, name, price, stock = product
 
-        if self._add_product_to_cart(product_id, name, price, stock, 1):
-            self.status_var.set(f"Added by barcode: {name}")
-
-    def poll_phone_scans(self):
-        updated = False
-        while True:
-            barcode = pop_scanned_barcode()
-            if barcode is None:
-                break
-            self._add_by_barcode(barcode)
-            updated = True
-
-        if updated:
-            self.barcode_entry.focus_set()
-
-        self.root.after(500, self.poll_phone_scans)
+        if self._add_product_to_cart(product_id, name, price, stock, requested_qty):
+            if requested_qty > 1:
+                self.status_var.set(f"Added by scan: {name} x{requested_qty}")
+            elif scanned_details.get("barcode") and scanned_details.get("barcode") != str(barcode).strip():
+                self.status_var.set(f"Added by scan: {name} ({normalized_barcode})")
+            else:
+                self.status_var.set(f"Added by barcode: {name}")
 
     def refresh_cart(self):
         self.cart_listbox.delete(0, tk.END)
@@ -707,6 +1383,57 @@ class BillingUI:
         # update QR area based on current payment mode & total
         self._update_qr_display(final_total)
 
+    def _focus_widget(self, widget):
+        widget.focus_set()
+        if hasattr(widget, "selection_range"):
+            try:
+                widget.selection_range(0, tk.END)
+            except Exception:
+                pass
+        return "break"
+
+    def handle_search_submit(self, _event=None):
+        self.search_products()
+        if not self.search_results:
+            self.status_var.set("No matching product found.")
+            return "break"
+
+        if len(self.search_results) == 1:
+            self.quantity_entry.focus_set()
+            self.quantity_entry.selection_range(0, tk.END)
+        else:
+            self.results_listbox.focus_set()
+        return "break"
+
+    def handle_results_activate(self, _event=None):
+        selected = self.results_listbox.curselection()
+        if not selected and self.search_results:
+            self.results_listbox.selection_set(0)
+            self.results_listbox.activate(0)
+        self.quantity_entry.focus_set()
+        self.quantity_entry.selection_range(0, tk.END)
+        return "break"
+
+    def handle_quantity_submit(self, _event=None):
+        self.add_to_cart()
+        return "break"
+
+    def open_admin_panel(self):
+        existing_panel = getattr(self, "admin_panel", None)
+        if existing_panel is not None:
+            try:
+                if existing_panel.window.winfo_exists():
+                    existing_panel.window.deiconify()
+                    existing_panel.window.lift()
+                    existing_panel.window.focus_force()
+                    self.status_var.set("Admin database panel focused.")
+                    return
+            except Exception:
+                pass
+
+        self.admin_panel = open_admin_panel(self.root, on_data_changed=self.refresh_system_state)
+        self.status_var.set("Admin database panel opened.")
+
     def remove_selected_cart_item(self, _event=None):
         selected = self.cart_listbox.curselection()
         if not selected:
@@ -717,6 +1444,22 @@ class BillingUI:
         removed_item = self.cart.pop(item_index)
         self.refresh_cart()
         self.status_var.set(f"Removed from cart: {removed_item['name']}")
+
+    def clear_cart(self):
+        if not self.cart:
+            self.status_var.set("Cart is already empty.")
+            return
+
+        confirmed = messagebox.askyesno("Clear Cart", "Remove all items from the current cart?")
+        if not confirmed:
+            return
+
+        self.cart = []
+        self.discount_entry.delete(0, tk.END)
+        self.discount_entry.insert(0, "0")
+        self.refresh_cart()
+        self.status_var.set("Cart cleared.")
+        self.barcode_entry.focus_set()
 
     def open_phonepe_collection(self):
         totals = self._calculate_bill_totals(show_error=True)
@@ -791,3 +1534,4 @@ class BillingUI:
         self.refresh_cart()
         self.search_products()
         self.refresh_receipts_box()
+        self.barcode_entry.focus_set()

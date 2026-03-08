@@ -1,7 +1,9 @@
+import importlib.util
 import os
 import shutil
 import socket
 import subprocess
+import sys
 from typing import Dict, Optional
 
 from config import DB_PATH
@@ -14,6 +16,17 @@ from config import DB_PATH
 def _which(cmd: str) -> Optional[str]:
     """Return the full path to *cmd* or None if not present."""
     return shutil.which(cmd)
+
+
+def _sqlite_web_command():
+    command_path = _which("sqlite_web")
+    if command_path:
+        return [command_path], None
+
+    if importlib.util.find_spec("sqlite_web") is not None:
+        return [sys.executable, "-m", "sqlite_web"], None
+
+    return None, "sqlite_web command/module not found; install the 'sqlite-web' package"
 
 
 def _find_free_port(start: int = 8080, end: int = 8090) -> int:
@@ -61,18 +74,22 @@ def start_sqlite_web(port: Optional[int] = None, readonly: bool = False) -> Dict
         except ValueError as exc:
             return {"success": False, "message": str(exc)}
 
-    if not _which("sqlite_web"):
-        return {
-            "success": False,
-            "message": "sqlite_web command not found; install the 'sqlite-web' package",
-        }
+    command, command_error = _sqlite_web_command()
+    if command is None:
+        return {"success": False, "message": command_error}
 
-    args = ["sqlite_web", DB_PATH, "--port", str(port)]
+    args = list(command) + [DB_PATH, "--port", str(port)]
     if readonly:
         args.append("--readonly")
 
     try:
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
         return {"success": True, "url": f"http://127.0.0.1:{port}", "process": proc}
     except Exception as exc:  # pragma: no cover - rare system error
         return {"success": False, "message": str(exc)}

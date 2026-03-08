@@ -1,7 +1,8 @@
 import sqlite3
 import time
+import shutil
 from pathlib import Path
-from config import DB_PATH
+from config import DB_PATH, SEED_DB_PATH
 
 
 def _is_db_locked(exc):
@@ -16,9 +17,30 @@ def _column_exists(cur, table_name, column_name):
 
 def connect():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+    _ensure_db_seed()
+    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 15000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
     return conn
+
+
+def _ensure_db_seed():
+    db_path = Path(DB_PATH)
+    if db_path.exists():
+        return
+
+    seed_path = Path(SEED_DB_PATH)
+    if not seed_path.exists():
+        return
+
+    try:
+        shutil.copy2(seed_path, db_path)
+    except Exception:
+        # fall back to empty database creation if the bundled seed cannot be copied
+        return
 
 
 def create_tables():
@@ -74,6 +96,12 @@ def create_tables():
 
             if not _column_exists(cur, "sales", "payment_mode"):
                 cur.execute("ALTER TABLE sales ADD COLUMN payment_mode TEXT DEFAULT 'Cash'")
+
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_products_name ON products(name COLLATE NOCASE)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(date)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items(sale_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_recent_receipts_created_at ON recent_receipts(created_at DESC)")
 
             conn.commit()
             return
