@@ -103,6 +103,34 @@ class PhonePeUiTest(unittest.TestCase):
         self.assertEqual(qr_instance.image.convert_mode, "RGB")
         self.assertEqual(qr_instance.image.resize_args, ((210, 210), "nearest"))
 
+    def test_load_image_tk_backend_uses_runtime_fallback(self):
+        fake_imagetk = object()
+        with patch.object(phonepe_ui, "_PIL_IMAGETK", None), patch.object(
+            phonepe_ui, "_PIL_IMPORT_ERROR", ImportError("missing imagetk")
+        ), patch.object(
+            phonepe_ui,
+            "_import_runtime_module",
+            return_value=(fake_imagetk, None),
+        ):
+            result, error = phonepe_ui._load_image_tk_backend()
+
+        self.assertIs(result, fake_imagetk)
+        self.assertIsNone(error)
+
+    def test_load_pil_image_backend_uses_runtime_fallback(self):
+        fake_image = object()
+        with patch.object(phonepe_ui, "_PIL_IMAGE", None), patch.object(
+            phonepe_ui, "_PIL_IMPORT_ERROR", ImportError("missing pillow")
+        ), patch.object(
+            phonepe_ui,
+            "_import_runtime_module",
+            return_value=(fake_image, None),
+        ):
+            result, error = phonepe_ui._load_pil_image_backend()
+
+        self.assertIs(result, fake_image)
+        self.assertIsNone(error)
+
 
 if __name__ == "__main__":
     unittest.main()

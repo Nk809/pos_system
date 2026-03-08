@@ -31,7 +31,7 @@ from features.device_status import (
     set_bluetooth_radio_enabled,
     set_wifi_radio_enabled,
 )
-from features.phonepe_ui import build_upi_qr_image, open_phonepe_payment_window
+from features.phonepe_ui import _load_image_tk_backend, _load_pil_image_backend, build_upi_qr_image, open_phonepe_payment_window
 from features.runtime_settings import get_printer_setting, update_printer_settings
 from features.scanner_utils import extract_scanned_code, parse_scanned_payload
 from features.thermal_printer import print_bill, print_test_receipt
@@ -446,21 +446,44 @@ class BillingUI:
 
     def _resolve_runtime_asset_path(self, raw_path):
         image_path = Path(raw_path).expanduser()
-        if image_path.is_absolute():
-            return image_path
+        candidate_roots = [Path("")]
+        fallback_path = image_path
 
-        bundled_path = BUNDLED_BASE_DIR / image_path
-        if bundled_path.exists():
-            return bundled_path
+        if not image_path.is_absolute():
+            candidate_roots = [BUNDLED_BASE_DIR, BASE_DIR]
+            fallback_path = BASE_DIR / image_path
 
-        return BASE_DIR / image_path
+        candidate_suffixes = [image_path.suffix.lower(), ".jpg", ".jpeg", ".png", ".svg"]
+        seen_paths = set()
+        for candidate_root in candidate_roots:
+            base_candidate = candidate_root / image_path
+            variants = [base_candidate]
+            stem_candidate = base_candidate.with_suffix("") if base_candidate.suffix else base_candidate
+            for suffix in candidate_suffixes:
+                if not suffix:
+                    continue
+                variants.append(stem_candidate.with_suffix(suffix))
+
+            for candidate in variants:
+                candidate_key = str(candidate)
+                if candidate_key in seen_paths:
+                    continue
+                seen_paths.add(candidate_key)
+                if candidate.exists():
+                    return candidate
+
+        return fallback_path
 
     def _apply_header_logo_image(self):
         if not self._logo_image_path or not self._logo_image_path.exists():
+            self._reset_header_logo_image()
             return False
 
         try:
-            from PIL import Image, ImageTk
+            ImageTk, imagetk_error = _load_image_tk_backend()
+            Image, image_error = _load_pil_image_backend()
+            if ImageTk is None or Image is None:
+                raise ImportError(imagetk_error or image_error or "Pillow ImageTk backend is unavailable")
             logo_size = 62
 
             logo_path = str(self._logo_image_path)
@@ -486,7 +509,30 @@ class BillingUI:
             )
             return True
         except Exception:
+            self._reset_header_logo_image()
             return False
+
+    def _reset_header_logo_image(self):
+        self._header_logo_photo = None
+        self.header_logo_label.config(
+            image="",
+            text="MG",
+            font=("Arial", 12, "bold"),
+            bg="#f2f4f7",
+            fg="#1f2937",
+            width=4,
+            height=1,
+            bd=2,
+            relief=tk.GROOVE,
+            padx=8,
+            pady=4,
+        )
+
+    def _refresh_runtime_assets(self):
+        self._background_image_path = self._resolve_background_image_path()
+        self._logo_image_path = self._resolve_logo_image_path()
+        self._apply_header_logo_image()
+        self._render_watermark_background()
 
     def _draw_background_image(self, width, height):
         if not self._background_image_path:
@@ -495,7 +541,10 @@ class BillingUI:
             return False
 
         try:
-            from PIL import Image, ImageTk
+            ImageTk, imagetk_error = _load_image_tk_backend()
+            Image, image_error = _load_pil_image_backend()
+            if ImageTk is None or Image is None:
+                raise ImportError(imagetk_error or image_error or "Pillow ImageTk backend is unavailable")
 
             resized = Image.open(self._background_image_path).convert("RGB").resize((width, height), Image.LANCZOS)
             self._background_photo = ImageTk.PhotoImage(resized)
@@ -867,9 +916,7 @@ class BillingUI:
 
     def toggle_service_links(self, _event=None):
         if self.service_links_visible:
-            self.service_links_visible = False
-            self.service_links_panel.pack_forget()
-            self.service_toggle_button.config(text="...")
+            self._hide_service_links_panel()
             self.status_var.set("Database panel hidden.")
             return
 
@@ -894,6 +941,12 @@ class BillingUI:
         self.service_links_panel.pack(fill=tk.X, pady=(0, 8), before=self.receipts_card)
         self.service_toggle_button.config(text="x")
         self.status_var.set("Database panel unlocked.")
+
+    def _hide_service_links_panel(self):
+        self.service_links_visible = False
+        self.service_links_unlocked = False
+        self.service_links_panel.pack_forget()
+        self.service_toggle_button.config(text="...")
 
     def _prompt_service_passcode(self):
         passcode = simpledialog.askstring(
@@ -938,6 +991,9 @@ class BillingUI:
     def refresh_system_state(self, _event=None):
         self._scanner_buffer = ""
         self._scanner_last_char_at = 0.0
+        if self.service_links_visible:
+            self._hide_service_links_panel()
+        self._refresh_runtime_assets()
         self.refresh_device_status(update_status=False)
         self.refresh_cart()
         self.refresh_receipts_box()
@@ -1003,12 +1059,22 @@ class BillingUI:
         if mode == "Online" and total > 0:
             qr_result = build_upi_qr_image(total, size=200)
             if qr_result.get("success"):
-                from PIL import ImageTk
-
-                photo = ImageTk.PhotoImage(qr_result["image"])
-                self.qr_label.config(image=photo)
-                self.qr_label.image = photo
-                self.qr_hint.config(text=f"Scan to pay | UPI ID: {qr_result.get('upi_id')}")
+                ImageTk, imagetk_error = _load_image_tk_backend()
+                if ImageTk is None:
+                    self.qr_label.config(image="")
+                    self.qr_label.image = None
+                    self.qr_hint.config(text=f"QR preview unavailable. Install pillow. Details: {imagetk_error}")
+                else:
+                    try:
+                        photo = ImageTk.PhotoImage(qr_result["image"])
+                    except Exception as exc:
+                        self.qr_label.config(image="")
+                        self.qr_label.image = None
+                        self.qr_hint.config(text=f"QR preview unavailable. Details: {exc}")
+                    else:
+                        self.qr_label.config(image=photo)
+                        self.qr_label.image = photo
+                        self.qr_hint.config(text=f"Scan to pay | UPI ID: {qr_result.get('upi_id')}")
             else:
                 self.qr_label.config(image="")
                 self.qr_label.image = None

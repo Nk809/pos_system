@@ -1,11 +1,81 @@
 import tkinter as tk
 import sys
 import math
+import importlib
 from tkinter import messagebox
 from pathlib import Path
 from urllib.parse import quote
 
 from config import UPI_ID, UPI_PAYEE_NAME
+
+try:
+    import qrcode as _QRCODE_MODULE
+except Exception as _qr_import_exc:
+    _QRCODE_MODULE = None
+    _QR_IMPORT_ERROR = _qr_import_exc
+else:
+    _QR_IMPORT_ERROR = None
+
+try:
+    from PIL import Image as _PIL_IMAGE
+    from PIL import ImageTk as _PIL_IMAGETK
+except Exception as _pil_import_exc:
+    _PIL_IMAGE = None
+    _PIL_IMAGETK = None
+    _PIL_IMPORT_ERROR = _pil_import_exc
+else:
+    _PIL_IMPORT_ERROR = None
+
+
+def _project_venv_site_dirs():
+    project_root = Path(__file__).resolve().parent.parent
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return [
+        project_root / ".venv" / "lib" / f"python{py_ver}" / "site-packages",
+        project_root / ".venv" / "Lib" / "site-packages",
+    ]
+
+
+def _clear_loaded_packages(package_roots):
+    cleared_modules = {}
+    for module_name in list(sys.modules):
+        if any(module_name == root or module_name.startswith(f"{root}.") for root in package_roots):
+            cleared_modules[module_name] = sys.modules.pop(module_name)
+    return cleared_modules
+
+
+def _restore_loaded_packages(cleared_modules):
+    for module_name, module_obj in cleared_modules.items():
+        if module_name not in sys.modules:
+            sys.modules[module_name] = module_obj
+
+
+def _import_runtime_module(module_name, package_roots):
+    last_exc = None
+
+    for venv_site in _project_venv_site_dirs():
+        if not venv_site.is_dir():
+            continue
+
+        venv_site_text = str(venv_site)
+        if venv_site_text in sys.path:
+            sys.path.remove(venv_site_text)
+        sys.path.insert(0, venv_site_text)
+
+        cleared_modules = _clear_loaded_packages(package_roots)
+        try:
+            importlib.invalidate_caches()
+            return importlib.import_module(module_name), None
+        except Exception as exc:
+            last_exc = exc
+            _clear_loaded_packages(package_roots)
+            _restore_loaded_packages(cleared_modules)
+            try:
+                sys.path.remove(venv_site_text)
+            except ValueError:
+                pass
+
+    return None, last_exc
 
 
 def _build_upi_uri(amount):
@@ -56,33 +126,60 @@ def get_upi_payment_details(amount):
     }
 
 
+def _load_pil_image_backend():
+    if _PIL_IMAGE is not None:
+        return _PIL_IMAGE, None
+
+    first_exc = _PIL_IMPORT_ERROR
+    if first_exc is None:
+        first_exc = ImportError("Pillow Image backend is unavailable")
+
+    image_module, import_error = _import_runtime_module("PIL.Image", ("PIL",))
+    if image_module is not None:
+        globals()["_PIL_IMAGE"] = image_module
+        globals()["_PIL_IMPORT_ERROR"] = None
+        return image_module, None
+
+    return None, import_error or first_exc
+
+
 def _load_qr_backends():
-    try:
-        import qrcode
-        from PIL import Image
+    qrcode_module = _QRCODE_MODULE
+    qr_error = _QR_IMPORT_ERROR
+    if qrcode_module is None:
+        qrcode_module, qr_error = _import_runtime_module("qrcode", ("qrcode",))
+        if qrcode_module is not None:
+            globals()["_QRCODE_MODULE"] = qrcode_module
+            globals()["_QR_IMPORT_ERROR"] = None
 
-        return qrcode, Image, None
-    except Exception as first_exc:
-        project_root = Path(__file__).resolve().parent.parent
-        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
-        candidate_sites = [
-            project_root / ".venv" / "lib" / f"python{py_ver}" / "site-packages",
-            project_root / ".venv" / "Lib" / "site-packages",
-        ]
-        for venv_site in candidate_sites:
-            if not venv_site.is_dir():
-                continue
-            venv_site_text = str(venv_site)
-            if venv_site_text not in sys.path:
-                sys.path.append(venv_site_text)
-            try:
-                import qrcode
-                from PIL import Image
+    image_module, pil_error = _load_pil_image_backend()
+    if qrcode_module is not None and image_module is not None:
+        return qrcode_module, image_module, None
 
-                return qrcode, Image, None
-            except Exception:
-                continue
-        return None, None, first_exc
+    first_exc = qr_error or pil_error or _QR_IMPORT_ERROR or _PIL_IMPORT_ERROR
+    if first_exc is None:
+        first_exc = ImportError("qrcode or Pillow is unavailable")
+    return None, None, first_exc
+
+
+def _load_image_tk_backend():
+    if _PIL_IMAGETK is not None:
+        return _PIL_IMAGETK, None
+
+    first_exc = _PIL_IMPORT_ERROR
+    if first_exc is None:
+        first_exc = ImportError("Pillow ImageTk backend is unavailable")
+
+    imagetk_module, import_error = _import_runtime_module("PIL.ImageTk", ("PIL",))
+    if imagetk_module is not None:
+        globals()["_PIL_IMAGETK"] = imagetk_module
+        globals()["_PIL_IMPORT_ERROR"] = None
+        pil_image_module = sys.modules.get("PIL.Image")
+        if pil_image_module is not None:
+            globals()["_PIL_IMAGE"] = pil_image_module
+        return imagetk_module, None
+
+    return None, import_error or first_exc
 
 
 def build_upi_qr_image(amount, size=290):
@@ -166,13 +263,15 @@ def open_phonepe_payment_window(parent, amount, on_received=None):
     qr_photo = None
     qr_result = build_upi_qr_image(payable_amount, size=290)
     if qr_result.get("success"):
-        from PIL import ImageTk
-
-        qr_img = qr_result["image"]
-        qr_photo = ImageTk.PhotoImage(qr_img)
-        qr_label = tk.Label(qr_holder, image=qr_photo)
-        qr_label.image = qr_photo
-        qr_label.pack(pady=(10, 6))
+        ImageTk, imagetk_error = _load_image_tk_backend()
+        if ImageTk is None:
+            qr_message = f"QR preview unavailable. Install pillow. Details: {imagetk_error}"
+        else:
+            qr_img = qr_result["image"]
+            qr_photo = ImageTk.PhotoImage(qr_img)
+            qr_label = tk.Label(qr_holder, image=qr_photo)
+            qr_label.image = qr_photo
+            qr_label.pack(pady=(10, 6))
     else:
         qr_message = qr_result.get("message", qr_message)
 
