@@ -1,5 +1,6 @@
 import tkinter as tk
 import sys
+import math
 from tkinter import messagebox
 from pathlib import Path
 from urllib.parse import quote
@@ -24,8 +25,22 @@ def _upi_is_configured():
     return bool(raw) and "your-upi-id" not in raw and "example" not in raw
 
 
+def _normalize_amount(amount):
+    try:
+        numeric_amount = float(amount)
+    except (TypeError, ValueError):
+        raise ValueError("Amount must be a valid number.")
+
+    if not math.isfinite(numeric_amount):
+        raise ValueError("Amount must be a finite number.")
+    if numeric_amount <= 0:
+        raise ValueError("Amount must be greater than zero.")
+
+    return round(numeric_amount, 2)
+
+
 def get_upi_payment_details(amount):
-    payable_amount = round(float(amount), 2)
+    payable_amount = _normalize_amount(amount)
     upi_uri = _build_upi_uri(payable_amount)
     configured = _upi_is_configured()
     message = "Scan QR using PhonePe to pay."
@@ -71,7 +86,19 @@ def _load_qr_backends():
 
 
 def build_upi_qr_image(amount, size=290):
-    details = get_upi_payment_details(amount)
+    try:
+        details = get_upi_payment_details(amount)
+    except ValueError as exc:
+        return {
+            "amount": amount,
+            "configured": _upi_is_configured(),
+            "upi_id": str(UPI_ID or "").strip(),
+            "upi_uri": "",
+            "message": str(exc),
+            "success": False,
+            "image": None,
+        }
+
     if not details["configured"]:
         return {**details, "success": False, "image": None}
 
@@ -85,7 +112,17 @@ def build_upi_qr_image(amount, size=290):
         }
 
     try:
-        qr_img = qrcode.make(details["upi_uri"]).resize((int(size), int(size)), Image.NEAREST)
+        qr_size = max(int(size), 120)
+        qr_builder = qrcode.QRCode(
+            version=None,
+            error_correction=getattr(qrcode.constants, "ERROR_CORRECT_M", 0),
+            box_size=12,
+            border=4,
+        )
+        qr_builder.add_data(details["upi_uri"])
+        qr_builder.make(fit=True)
+        qr_img = qr_builder.make_image(fill_color="black", back_color="white").convert("RGB")
+        qr_img = qr_img.resize((qr_size, qr_size), Image.NEAREST)
         return {**details, "success": True, "image": qr_img}
     except Exception as exc:
         return {
