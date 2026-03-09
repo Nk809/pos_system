@@ -67,3 +67,4 @@ Notes:
 
 ## Optional Database Browser
 The app can launch a local `sqlite-web` process for database inspection. If it is not installed, the POS still runs normally in offline mode.
+# pos_system
